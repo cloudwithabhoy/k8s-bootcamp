@@ -1006,3 +1006,165 @@ kubectl label node node-1 disk=ssd                 # Add label to node
 **Real scenario:** A Service was returning 404s even though the pods were running fine. `kubectl get endpoints my-app-service` showed zero endpoints. The problem: the pod had `app: my-app-v2` but the Service selector was `app: my-app`. Labels didn't match → Service couldn't find the pods → no traffic routed. Changed the pod labels to match and traffic flowed immediately. This is the #1 cause of "my Service isn't working" issues.
 
 ---
+
+## 25. What are Taints and Tolerations in Kubernetes?
+
+**Taints** are applied to nodes — they repel pods from being scheduled there. **Tolerations** are applied to pods — they allow a pod to be scheduled on a tainted node. Together, they give you control over which pods run on which nodes.
+
+Think of it like this:
+- **Taint** = a "No entry" sign on a node
+- **Toleration** = a special pass the pod carries that lets it through
+
+**Applying a taint to a node:**
+```bash
+kubectl taint nodes node-1 gpu=true:NoSchedule
+```
+
+This means: "Don't schedule any pod on node-1 unless it explicitly tolerates `gpu=true`."
+
+Three taint effects:
+- `NoSchedule` — new pods without the toleration won't be scheduled here
+- `PreferNoSchedule` — K8s will try to avoid scheduling here, but not strictly
+- `NoExecute` — new pods won't schedule AND existing pods without the toleration are evicted
+
+**Adding a toleration to a pod:**
+```yaml
+spec:
+  tolerations:
+    - key: "gpu"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+  containers:
+    - name: ml-trainer
+      image: ml-trainer:v1.0
+```
+
+This pod can now be scheduled on nodes tainted with `gpu=true:NoSchedule`.
+
+**Common real-world uses:**
+
+| Use Case | Taint on Node | Toleration on Pod |
+|---|---|---|
+| GPU nodes for ML workloads | `gpu=true:NoSchedule` | ML training pods only |
+| Spot/preemptible nodes | `spot=true:NoSchedule` | Batch jobs, workers |
+| Dedicated nodes per team | `team=payments:NoSchedule` | Payments pods only |
+| Node under maintenance | `node.kubernetes.io/unschedulable:NoSchedule` | Added automatically by K8s |
+
+**Taints vs Node Affinity — what's the difference:**
+- **Taints/Tolerations** = used to *repel* pods from nodes (push model — node pushes pods away)
+- **Node Affinity** = used to *attract* pods to specific nodes (pull model — pod chooses node)
+
+In practice, use both together: taint GPU nodes to keep regular pods off, and add node affinity to ML pods to ensure they land on GPU nodes specifically.
+
+```yaml
+spec:
+  tolerations:
+    - key: "gpu"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: gpu
+                operator: In
+                values:
+                  - "true"
+```
+
+**Real scenario:** We had a 10-node cluster where 2 nodes had NVMe SSDs for high-IOPS database workloads. Without taints, the scheduler freely placed regular API pods on those nodes, consuming resources meant for the database. We tainted the SSD nodes with `disk=nvme:NoSchedule` and added the toleration only to the database StatefulSets. After that, the SSD nodes were exclusively used for databases and API pods no longer competed for that capacity. Query latency dropped by 40% because the database pods were no longer sharing nodes with CPU-heavy services.
+
+**Removing a taint:**
+```bash
+kubectl taint nodes node-1 gpu=true:NoSchedule-   # The trailing dash removes it
+```
+
+---
+
+## 26. What Load Balancer do you use in Kubernetes and why?
+
+In Kubernetes, "Load Balancer" can mean two different things — the **Service type** and the **Ingress Controller**. In production, we use both, but for different purposes.
+
+**Service type `LoadBalancer` — for raw TCP/UDP or when you need a dedicated external IP:**
+
+When you set `type: LoadBalancer` on a Service, the cloud provider provisions a load balancer (AWS NLB, Azure LB, GCP Load Balancer) with a public IP that routes directly to your pods.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+spec:
+  type: LoadBalancer
+  selector:
+    app: my-app
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+**Problem:** Every Service gets its own cloud load balancer. At $18-25/month each on AWS, 20 services = $400-500/month just on load balancers.
+
+**Ingress Controller — for HTTP/HTTPS traffic (recommended for most services):**
+
+One cloud load balancer sits in front of an **Ingress Controller** (NGINX, Traefik, AWS ALB). The controller reads Ingress rules and routes traffic based on hostname and path — all through a single LB.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 80
+```
+
+**Which one we use and why:**
+
+| Scenario | Choice | Reason |
+|---|---|---|
+| HTTP/HTTPS microservices | NGINX Ingress Controller | One LB for all services, host/path routing, TLS termination |
+| Internal services | ClusterIP | No external exposure needed |
+| Non-HTTP (gRPC, TCP, databases) | Service `LoadBalancer` or NodePort | Ingress only handles HTTP |
+| AWS-native auth (Cognito, WAF) | AWS ALB Ingress Controller | Native integration with AWS services |
+
+**Our production setup:**
+
+We run **NGINX Ingress Controller** behind a single AWS NLB. All HTTP/HTTPS traffic enters through one NLB → NGINX routes to the correct service by hostname. TLS is terminated at NGINX using certs managed by cert-manager (auto-renewed from Let's Encrypt).
+
+```
+User → Route53 → AWS NLB → NGINX Ingress Controller → Service → Pod
+```
+
+For internal service-to-service communication, everything uses `ClusterIP` — no load balancer involved, just K8s DNS + kube-proxy round-robin.
+
+**Real scenario:** When we first set up the cluster, each of our 12 microservices had `type: LoadBalancer`. Monthly bill for load balancers alone: $216. We switched to a single NGINX Ingress Controller with host-based routing rules. All 12 services went behind one NLB. Monthly LB cost dropped to $18 — a 92% reduction with zero change in functionality. The switch took one afternoon: create the Ingress resources, update DNS records in Route53, delete the old LoadBalancer services.
+
+**When NOT to use an Ingress Controller:**
+- If the service needs raw TCP (e.g., a custom protocol, a database exposed externally) — use `LoadBalancer` directly
+- If you're on a bare-metal cluster without a cloud provider — use MetalLB to get LoadBalancer functionality, or use NodePort + an external load balancer
+
+---

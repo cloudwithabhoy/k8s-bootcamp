@@ -399,3 +399,135 @@ Use network-attached storage (EBS, Azure Disk) with cross-AZ replication, not lo
 **Real scenario:** We ran a single-AZ EKS cluster to save costs. AWS had an AZ outage — our entire cluster went down for 47 minutes. After that, we moved to multi-AZ with nodes in 3 AZs, pod anti-affinity rules, and PDBs on every critical service. The next AZ outage (6 months later) — zero impact. Pods in the affected AZ rescheduled to healthy AZs within 2 minutes. The slight cost increase for multi-AZ was nothing compared to the 47-minute outage.
 
 ---
+
+## 10. What is Helm chart signing? How does it work and which tools are used?
+
+Helm chart signing lets you **cryptographically verify** that a chart was published by a trusted source and hasn't been tampered with since. Without signing, anyone who gains write access to your chart registry can push a malicious chart, and consumers would have no way to detect it.
+
+**How it works — two artifacts per chart:**
+
+When you sign a chart, Helm produces two files:
+- `my-app-1.4.0.tgz` — the chart package
+- `my-app-1.4.0.tgz.prov` — the provenance file (contains a cryptographic hash of the chart + a PGP signature)
+
+The provenance file lets anyone verify:
+1. The chart content matches the hash (integrity — not tampered with)
+2. The signature was made by a known key (authenticity — from a trusted publisher)
+
+**Tools used:**
+
+| Tool | Role |
+|---|---|
+| **GPG (GnuPG)** | Key generation and PGP signing — the core signing mechanism |
+| **Helm** | Built-in `helm package --sign` and `helm verify` commands |
+| **Cosign (Sigstore)** | Modern alternative to GPG, keyless signing via OIDC — growing adoption |
+| **OCI registries (ECR, GHCR)** | Store signed charts as OCI artifacts alongside signatures |
+| **Notation** | CNCF signing tool for OCI artifacts, used with OCI-based Helm chart registries |
+
+**Step-by-step: Signing with GPG + Helm**
+
+**Step 1: Generate a GPG key pair**
+```bash
+gpg --gen-key
+# Enter name, email, passphrase
+# This creates a public/private key pair in your keyring
+```
+
+**Step 2: Export public key for distribution**
+```bash
+gpg --export -a "Your Name" > helm-signing.pub
+# Publish this to a keyserver or share with your team
+```
+
+**Step 3: Package and sign the chart**
+```bash
+helm package my-app/ \
+  --sign \
+  --key "Your Name" \
+  --keyring ~/.gnupg/secring.gpg \
+  --passphrase-file ./passphrase.txt
+
+# Produces:
+# my-app-1.4.0.tgz
+# my-app-1.4.0.tgz.prov
+```
+
+**Step 4: Push both files to chart registry**
+```bash
+helm push my-app-1.4.0.tgz oci://your-registry/charts
+helm push my-app-1.4.0.tgz.prov oci://your-registry/charts
+```
+
+**Step 5: Verify before installing**
+```bash
+# Import the publisher's public key first
+gpg --import helm-signing.pub
+
+# Verify the chart on download
+helm verify my-app-1.4.0.tgz
+
+# Or verify during install directly
+helm install my-app oci://your-registry/charts/my-app \
+  --verify \
+  --keyring ./trusted-keys.gpg
+```
+
+If verification fails — tampered chart, wrong key, or missing provenance file — Helm refuses to install and exits with an error.
+
+**Modern approach: Cosign (keyless signing)**
+
+GPG key management is operationally heavy — key rotation, distribution, revocation. Cosign with Sigstore offers **keyless signing** where identity is tied to OIDC (GitHub Actions identity, GCP service account, etc.) instead of a manually managed key:
+
+```bash
+# In CI (GitHub Actions) — signs using the workflow's OIDC identity
+cosign sign --yes oci://your-registry/charts/my-app:1.4.0
+
+# Verify — no key file needed, identity is verified against Sigstore's transparency log
+cosign verify oci://your-registry/charts/my-app:1.4.0 \
+  --certificate-identity "https://github.com/your-org/your-repo/.github/workflows/release.yaml@refs/heads/main" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+The signature is recorded in Sigstore's **Rekor** transparency log — a public, immutable ledger. Anyone can audit who signed what and when.
+
+**Enforcing signature verification in the cluster:**
+
+Signing only helps if you enforce verification at deploy time. Use **Kyverno** or **Connaisseur** to block unsigned or unverified charts:
+
+```yaml
+# Kyverno policy — block pods using images not signed by our key
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signature
+spec:
+  rules:
+    - name: check-image-signature
+      match:
+        resources:
+          kinds: ["Pod"]
+      verifyImages:
+        - imageReferences:
+            - "123456789.dkr.ecr.us-east-1.amazonaws.com/*"
+          attestors:
+            - entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subject: "https://github.com/your-org/*"
+```
+
+This means even if someone pushes a chart to your registry manually, pods using it will be blocked by Kyverno unless the image was signed by your CI pipeline.
+
+**Real scenario:** We passed a SOC2 Type II audit that required us to demonstrate software supply chain controls. The auditor specifically asked: "How do you ensure no unauthorized code runs in production?" We demonstrated:
+1. Every chart is signed by the CI pipeline using Cosign (keyless, tied to GitHub Actions identity)
+2. Kyverno blocks any pod using an image not in our ECR or without a valid Cosign signature
+3. Sigstore's Rekor log provides an immutable audit trail of every image ever signed
+
+Before implementing this, a developer had manually pushed a patched image to ECR during an incident to bypass the CI pipeline. It worked — no controls caught it. After signing enforcement, that same action would be blocked at the pod admission level, even for images that exist in ECR.
+
+**When to implement chart signing:**
+- If you distribute Helm charts publicly or to external consumers — mandatory
+- If you operate in regulated environments (PCI, HIPAA, SOC2) — mandatory
+- For internal-only charts in a small team — start with Cosign in CI (low effort), skip GPG key management complexity
+
+---

@@ -974,3 +974,263 @@ helm rollback my-app 1   # Reverts to revision 1
 **Real scenario:** We had 30 microservices, each with hand-written YAML files. Every time we added a standard label, updated resource limits template, or added a new sidecar, we had to edit 30 sets of files. After creating a shared Helm chart, all 30 services use the same templates with different `values.yaml`. Adding a new standard label is now a one-line change in the chart, applied everywhere on next deploy.
 
 ---
+
+## 24. How do you create and manage Kubernetes clusters using Terraform?
+
+Terraform treats the EKS/AKS/GKE cluster as infrastructure code — the same way you'd define a VPC or an S3 bucket. This means cluster creation, node group config, add-ons, and RBAC are all version-controlled, repeatable, and reviewable via PRs.
+
+**Typical EKS cluster structure in Terraform:**
+
+```
+terraform/
+├── main.tf           # EKS cluster, node groups, VPC
+├── variables.tf      # Input variables (region, cluster name, node size)
+├── outputs.tf        # Cluster endpoint, kubeconfig, OIDC issuer
+├── providers.tf      # AWS + Kubernetes + Helm providers
+└── versions.tf       # Terraform and provider version pins
+```
+
+**Core resources we define:**
+
+```hcl
+# VPC for the cluster
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name            = "eks-vpc"
+  cidr            = "10.0.0.0/16"
+  azs             = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+  enable_nat_gateway = true
+}
+
+# EKS cluster
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"
+
+  cluster_name    = var.cluster_name
+  cluster_version = "1.30"
+  vpc_id          = module.vpc.vpc_id
+  subnet_ids      = module.vpc.private_subnets
+
+  # IRSA — lets pods assume IAM roles via ServiceAccounts
+  enable_irsa = true
+
+  eks_managed_node_groups = {
+    general = {
+      instance_types = ["m5.large"]
+      min_size       = 2
+      max_size       = 10
+      desired_size   = 3
+    }
+    gpu = {
+      instance_types = ["g4dn.xlarge"]
+      min_size       = 0
+      max_size       = 4
+      desired_size   = 0
+      taints = [{
+        key    = "gpu"
+        value  = "true"
+        effect = "NO_SCHEDULE"
+      }]
+    }
+  }
+}
+```
+
+**Authenticating `kubectl` after cluster creation:**
+
+```hcl
+# outputs.tf
+output "configure_kubectl" {
+  value = "aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}"
+}
+```
+
+After `terraform apply`, the output tells you exactly how to configure `kubectl`. No manual steps.
+
+**Installing cluster add-ons via Terraform:**
+
+```hcl
+# Install CoreDNS, kube-proxy, VPC CNI as EKS managed add-ons
+resource "aws_eks_addon" "coredns" {
+  cluster_name = module.eks.cluster_name
+  addon_name   = "coredns"
+}
+
+# Install NGINX ingress via Helm provider
+resource "helm_release" "ingress_nginx" {
+  name       = "ingress-nginx"
+  repository = "https://kubernetes.github.io/ingress-nginx"
+  chart      = "ingress-nginx"
+  namespace  = "ingress-nginx"
+  create_namespace = true
+
+  set {
+    name  = "controller.replicaCount"
+    value = "2"
+  }
+}
+```
+
+**Managing cluster lifecycle:**
+
+```bash
+# Create cluster
+terraform init && terraform plan && terraform apply
+
+# Upgrade cluster version — change cluster_version = "1.31", then:
+terraform apply   # Triggers a managed rolling upgrade on EKS
+
+# Scale node group — change desired_size, then:
+terraform apply
+
+# Destroy cluster (careful — this deletes everything)
+terraform destroy
+```
+
+**State management — critical for teams:**
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "my-terraform-state"
+    key            = "eks/prod/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-locks"   # Prevents concurrent applies
+    encrypt        = true
+  }
+}
+```
+
+Remote state in S3 with DynamoDB locking means no two engineers can run `terraform apply` on the same cluster simultaneously — which prevents state corruption.
+
+**Real scenario:** Before Terraform, we provisioned EKS clusters manually via the AWS console. When we needed a second cluster for staging, an engineer spent 3 days recreating the same setup manually — and still got it slightly different (different CIDR, different node type). When that cluster had issues, nobody knew what was different from prod. After migrating to Terraform, spinning up a new cluster for a new team takes 20 minutes — `terraform workspace new team-x && terraform apply`. The configuration is identical to prod because it's the same code with different variable values.
+
+---
+
+## 25. Explain the folder structure of a Helm chart.
+
+A Helm chart is a directory with a specific layout that Helm expects. Every file has a purpose — Helm won't work correctly if you misplace or misname files.
+
+```
+my-app/                        ← Chart root (same name as chart)
+├── Chart.yaml                 ← Chart metadata (required)
+├── values.yaml                ← Default config values (required)
+├── values-staging.yaml        ← Environment-specific overrides (optional, convention)
+├── values-prod.yaml           ← Environment-specific overrides (optional, convention)
+├── .helmignore                ← Files to exclude from packaging (like .gitignore)
+├── charts/                    ← Subcharts / dependencies
+│   └── redis/                 ← A dependency chart (pulled via helm dependency update)
+├── templates/                 ← Kubernetes manifest templates (required)
+│   ├── deployment.yaml        ← Templated Deployment
+│   ├── service.yaml           ← Templated Service
+│   ├── ingress.yaml           ← Templated Ingress
+│   ├── configmap.yaml         ← Templated ConfigMap
+│   ├── hpa.yaml               ← Templated HorizontalPodAutoscaler
+│   ├── serviceaccount.yaml    ← Templated ServiceAccount
+│   ├── _helpers.tpl           ← Named templates / helper functions (NOT rendered directly)
+│   └── NOTES.txt             ← Post-install instructions shown to user after helm install
+└── crds/                      ← CustomResourceDefinitions (installed before templates)
+```
+
+**What each file does:**
+
+**`Chart.yaml`** — Metadata about the chart. Name, version, and app version are required.
+```yaml
+apiVersion: v2
+name: my-app
+description: Helm chart for my-app microservice
+type: application
+version: 1.4.0          # Chart version — bump this when chart structure changes
+appVersion: "2.1.3"     # App version — the image tag you're deploying
+```
+
+**`values.yaml`** — Default values used in templates. Every configurable thing lives here.
+```yaml
+replicaCount: 3
+image:
+  repository: 123456789.dkr.ecr.us-east-1.amazonaws.com/my-app
+  tag: "latest"
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 80
+ingress:
+  enabled: true
+  host: myapp.example.com
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+```
+
+**`templates/`** — All `.yaml` files here are rendered by Helm using Go templating and submitted to K8s.
+```yaml
+# templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-{{ .Chart.Name }}
+  labels:
+    app: {{ .Chart.Name }}
+    version: {{ .Chart.AppVersion }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  template:
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+```
+
+**`templates/_helpers.tpl`** — Named templates (partials) that are reused across multiple template files. They start with `_` so Helm knows not to render them directly as K8s objects.
+```yaml
+{{/* Common labels applied to all resources */}}
+{{- define "my-app.labels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion }}
+{{- end }}
+```
+
+Then used in any template: `{{- include "my-app.labels" . | nindent 4 }}`
+
+**`templates/NOTES.txt`** — Printed to the terminal after a successful `helm install`. Useful for showing access instructions.
+```
+Your app is deployed. Access it at:
+  http://{{ .Values.ingress.host }}
+```
+
+**`charts/`** — Dependency charts. Defined in `Chart.yaml` under `dependencies:` and pulled with `helm dependency update`.
+```yaml
+# Chart.yaml
+dependencies:
+  - name: redis
+    version: "17.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+```
+
+**`crds/`** — CustomResourceDefinitions placed here are installed before any templates. Used when your chart installs an Operator that needs its CRDs registered first.
+
+**Common Helm commands mapped to the structure:**
+
+```bash
+helm create my-app              # Generates the full folder structure with boilerplate
+helm lint my-app/               # Validates the chart structure and template syntax
+helm template my-app/ -f values-prod.yaml   # Renders templates locally without deploying
+helm install my-app ./my-app/ -f values-prod.yaml
+helm upgrade my-app ./my-app/ -f values-prod.yaml --set image.tag=v2.1.4
+helm package my-app/            # Packages chart into my-app-1.4.0.tgz for a chart registry
+```
+
+**Real scenario:** A new engineer joined the team and asked "where do I change the number of replicas for prod?" Before Helm, the answer was "find the deployment YAML for that service in the prod folder." With our Helm chart structure, the answer is: "open `values-prod.yaml`, change `replicaCount`, raise a PR." The structure made the chart self-documenting — all tunable parameters live in `values.yaml` as a single reference. We also run `helm lint` and `helm template` in CI on every PR, so broken templates are caught before they ever reach the cluster.
+
+---
