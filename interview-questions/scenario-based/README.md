@@ -556,3 +556,109 @@ After this type of incident, add **external black-box monitoring** — a probe t
 **Real scenario:** Production was "down" for 22 minutes. All dashboards green. No alerts. The root cause: a new NetworkPolicy was applied to the `ingress-nginx` namespace during a security hardening sprint. It blocked the ingress controller's egress to application pods. The ingress controller was healthy (its own health check passed), pods were healthy (readiness probes passed via kubelet, not via ingress), but the actual user traffic path was broken. We only found it because a customer called. After that, we added end-to-end synthetic tests that simulate real user requests through the full external path, alerting within 60 seconds of failure.
 
 ---
+
+## 19. A container works perfectly locally but fails in Kubernetes. How do you debug it?
+
+This is one of the most common frustrations. "It works on my machine" but crashes or misbehaves in the cluster. The gap is almost always in one of six areas: environment, networking, permissions, resources, secrets, or config.
+
+**Step 1: Get the exact failure**
+
+```bash
+kubectl describe pod <pod-name>     # Events, exit code, probe results
+kubectl logs <pod-name> --previous  # Last crash logs
+```
+
+Look at `Exit Code` in `Last State`:
+- `Exit Code: 1` — app error, check logs
+- `Exit Code: 137` — OOMKilled or SIGKILL
+- `Exit Code: 127` — command not found (wrong ENTRYPOINT or binary missing)
+- `Exit Code: 126` — permission denied on the executable
+
+**Step 2: Check the six common gaps**
+
+**1. Environment variables — missing or wrong values**
+
+Locally you have a `.env` file or shell exports. In K8s, env vars come from ConfigMaps, Secrets, or the pod spec. If any are missing, the app crashes on startup.
+
+```bash
+# Check what env vars the container actually sees
+kubectl exec <pod> -- env | sort
+
+# Common miss: DATABASE_URL locally is "localhost:5432"
+# In K8s it must be "postgres-service:5432"
+```
+
+**2. Non-root user — permission denied**
+
+Locally you run as root or your own user. In K8s with `runAsNonRoot: true`, the process may not have write access to files it expects.
+
+```bash
+kubectl exec <pod> -- whoami          # What user is the process running as?
+kubectl exec <pod> -- ls -la /app     # Does the user own the files?
+```
+
+Fix in Dockerfile:
+```dockerfile
+COPY --chown=appuser:appuser . /app
+USER appuser
+```
+
+**3. Resource limits — CPU throttling or OOMKill**
+
+Locally you have no limits. In K8s, tight limits that don't exist on your machine will kill the container. A JVM that works fine with 2GB RAM locally will OOMKill with a 256Mi limit.
+
+```bash
+kubectl describe pod <pod> | grep -A5 "Limits\|Requests"
+kubectl top pod <pod>
+```
+
+**4. Networking — service names vs localhost**
+
+Locally: `localhost:5432` for Postgres. In K8s: `postgres-service:5432`. If the app has `localhost` hardcoded, it won't find the database in the cluster.
+
+```bash
+kubectl exec <pod> -- nc -zv postgres-service 5432
+kubectl exec <pod> -- nslookup postgres-service
+```
+
+**5. File paths and mounted volumes**
+
+In K8s, a ConfigMap or Secret mounted at `/app/config/` replaces the entire directory — wiping out any files baked into the image at that path. Locally, no mount exists so the image's files are used.
+
+```bash
+kubectl exec <pod> -- ls /app/config/         # Are the expected files there?
+kubectl exec <pod> -- cat /app/config/app.yaml # Is the content correct?
+```
+
+**6. Image architecture mismatch**
+
+You build locally on Apple M1/M2 (ARM). Your K8s nodes are x86. The container starts locally but fails in the cluster with `exec format error`.
+
+```bash
+docker inspect <image> | grep Architecture
+
+# Build explicitly for the cluster's architecture
+docker buildx build --platform linux/amd64 -t my-app:v1 .
+```
+
+**Step 3: Run the same image interactively inside the cluster**
+
+If the above checks don't reveal the issue, run a debug pod using the exact same image in the cluster:
+
+```bash
+kubectl run debug \
+  --image=my-app:v1 \
+  --env="DATABASE_URL=postgres-service:5432" \
+  --command -- sleep 3600
+
+kubectl exec -it debug -- sh
+# Manually run the entrypoint and watch what fails
+```
+
+This puts you inside the exact cluster environment — same network, same DNS, same RBAC — without the restart cycle interfering with your investigation.
+
+**Real scenario:** A Node.js service worked perfectly in local Docker but crashed in K8s every time with `ENOENT: no such file or directory, open '/app/config/settings.json'`. The file existed in the Docker image. The problem: the Helm chart mounted a ConfigMap at `/app/config/` — which replaced the entire directory, wiping out `settings.json` that was baked into the image. Locally, no ConfigMap mount existed so the image's file was used fine.
+
+Fix: changed the ConfigMap mount from a directory mount to a single file mount at `/app/config/env-settings.json`. The image's `settings.json` was preserved and the ConfigMap values were available separately. We found it by running `kubectl exec <pod> -- ls /app/config/` and seeing only one file instead of three. Took 90 minutes to debug — would have taken 5 minutes with this checklist.
+
+---

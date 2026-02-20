@@ -531,3 +531,148 @@ Before implementing this, a developer had manually pushed a patched image to ECR
 - For internal-only charts in a small team — start with Cosign in CI (low effort), skip GPG key management complexity
 
 ---
+
+## 11. How do you define SLI, SLO, and SLA in production? How do you calculate error budget?
+
+These three concepts form the backbone of SRE. They answer: "How reliable is the system, what have we committed to, and how much risk can we take?"
+
+**Definitions:**
+
+**SLI (Service Level Indicator)** — a *measurement* of service behavior. A specific metric that tells you how the service is performing right now.
+
+**SLO (Service Level Objective)** — an *internal target* for an SLI. "We want this SLI to meet X% of the time." This is what your team commits to internally.
+
+**SLA (Service Level Agreement)** — an *external contract* with customers. Breach it and there are financial or legal consequences (credits, refunds, penalties). SLA is always looser than SLO — you need a buffer.
+
+```
+SLI: measurement  →  SLO: internal target  →  SLA: customer contract
+     (what it is)         (what we aim for)        (what we promise)
+```
+
+**Defining SLIs — choose what users actually care about:**
+
+Not all metrics make good SLIs. CPU usage is not an SLI — users don't experience CPU. They experience latency, errors, and availability.
+
+The **RED method** maps directly to SLIs:
+- **Rate** → requests per second (volume, not an SLI by itself)
+- **Errors** → error rate (% of requests returning 5xx)
+- **Duration** → latency (p50, p95, p99 response time)
+
+```yaml
+# Good SLIs for an HTTP API
+SLI-1: Availability     = successful requests / total requests × 100
+SLI-2: Latency          = % of requests completed in < 200ms
+SLI-3: Error rate       = 5xx responses / total responses × 100
+
+# Bad SLIs (don't reflect user experience)
+❌ CPU utilization
+❌ Memory usage
+❌ Pod restart count
+```
+
+**Defining SLOs — set realistic targets based on data:**
+
+```yaml
+# Example SLOs for an e-commerce checkout API
+SLO-1: Availability     ≥ 99.9%    over a 30-day rolling window
+SLO-2: Latency p99      ≤ 500ms    over a 30-day rolling window
+SLO-3: Error rate       ≤ 0.1%     over a 30-day rolling window
+```
+
+99.9% availability means you can afford **43.8 minutes of downtime per month**. 99.99% means only **4.38 minutes**. Choose your SLO based on what users need and what you can realistically maintain — not aspirationally.
+
+**Calculating Error Budget:**
+
+Error budget = the amount of unreliability you're *allowed* to have before breaching the SLO.
+
+```
+Error Budget = 100% - SLO target
+
+For SLO of 99.9% availability over 30 days:
+  Total minutes in 30 days = 30 × 24 × 60 = 43,200 minutes
+  Error budget = 0.1% × 43,200 = 43.2 minutes of allowed downtime
+```
+
+```promql
+# Current error budget consumption in Prometheus
+# How much of the 30-day budget has been burned?
+
+# Error rate over 30 days
+sum(rate(http_requests_total{status=~"5.."}[30d]))
+/
+sum(rate(http_requests_total[30d]))
+
+# Budget remaining (as %)
+1 - (
+  sum(rate(http_requests_total{status=~"5.."}[30d]))
+  /
+  sum(rate(http_requests_total[30d]))
+  /
+  0.001   # SLO error budget = 0.1%
+)
+```
+
+**How error budget drives decisions:**
+
+| Error Budget Remaining | Action |
+|---|---|
+| > 50% | Move fast — ship features, take risks, run chaos experiments |
+| 25–50% | Normal pace — review risky changes before merging |
+| < 25% | Slow down — freeze non-critical deployments, focus on reliability |
+| 0% (budget exhausted) | Feature freeze — all effort on reliability until budget recovers |
+
+This turns reliability into a data-driven conversation. Instead of "we need more stability" (vague), it becomes "we've burned 80% of our error budget in 10 days — no new feature deploys until we fix the root cause."
+
+**Implementing SLOs in Prometheus + Grafana:**
+
+```yaml
+# Prometheus recording rules for SLO tracking
+groups:
+  - name: slo.rules
+    rules:
+      # 5-minute error rate
+      - record: job:http_errors:rate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+          /
+          sum(rate(http_requests_total[5m])) by (job)
+
+      # 30-day availability
+      - record: job:availability:30d
+        expr: |
+          1 - (
+            sum(rate(http_requests_total{status=~"5.."}[30d])) by (job)
+            /
+            sum(rate(http_requests_total[30d])) by (job)
+          )
+```
+
+```yaml
+# Alert when burning error budget too fast (burn rate alert)
+- alert: HighErrorBudgetBurn
+  expr: |
+    job:http_errors:rate5m > (14.4 * 0.001)
+  for: 5m
+  annotations:
+    summary: "Burning error budget 14x faster than sustainable rate"
+```
+
+The `14.4x` multiplier means: at this rate, you'll exhaust the entire monthly budget in 2 days (30 days / 14.4 ≈ 2 days). This is a page-worthy alert.
+
+**SLA — the external contract:**
+
+SLA is always set below your SLO to create a buffer:
+
+```
+SLO: 99.9% availability (internal target)
+SLA: 99.5% availability (customer commitment)
+
+Buffer: 0.4% = ~173 minutes/month to absorb unexpected incidents
+        before you owe customers credits
+```
+
+Most companies set SLAs at 99.5% or 99% even when their SLOs are 99.9%, specifically so that a bad incident doesn't immediately trigger SLA penalties while the team is still recovering.
+
+**Real scenario:** Our payments team had no SLOs — just a vague "keep it up." During a 90-minute incident, the product team kept pushing new features mid-incident because they didn't know reliability was at risk. After defining SLOs (99.95% availability, p99 < 300ms), we set an error budget of 21.6 minutes/month. The first month, we burned 18 minutes in a single incident — 83% of our budget in one event. That data made the case for a feature freeze and a two-sprint reliability investment. No SLO → nobody knows the cost of incidents. SLO → the cost is visible, measurable, and actionable.
+
+---

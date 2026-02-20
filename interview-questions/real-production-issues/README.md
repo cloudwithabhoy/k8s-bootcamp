@@ -247,3 +247,121 @@ Set up billing alerts at 50%, 80%, and 100% of the staging budget. We use AWS Bu
 **Real scenario:** Our staging HPA was configured identically to production (`maxReplicas: 50`). A QA engineer ran a load test with 10x production traffic to "stress test." HPA scaled to 50 replicas, cluster autoscaler added 12 nodes. Staging cost that day: $800 (normally $50/day). After that, we: (1) set staging `maxReplicas: 10`, (2) added ResourceQuotas, (3) set the staging ASG max to 5 nodes, (4) added a daily cost alert. The load test would now be capped and the engineer would know immediately when they hit the ceiling.
 
 ---
+
+## 8. Cluster nodes are under memory pressure. What actions do you take?
+
+When nodes hit memory pressure, kubelet starts evicting pods to protect the node itself — first `BestEffort` pods (no requests/limits), then `Burstable` (requests < limits), then `Guaranteed` (requests = limits). If you don't act fast, the eviction cascade can take down healthy workloads.
+
+**Step 1: Confirm memory pressure and identify the scope**
+
+```bash
+# Check node conditions
+kubectl get nodes
+# Look for: MemoryPressure = True
+
+kubectl describe node <node-name>
+# Check Conditions section:
+# MemoryPressure   True    kubelet has insufficient memory available
+
+# See which pods are already evicted
+kubectl get pods -A | grep Evicted
+
+# Current memory usage per node
+kubectl top nodes
+```
+
+**Step 2: Find what's consuming the memory**
+
+```bash
+# Which pods are using the most memory on that node
+kubectl top pods -A --sort-by=memory | head -20
+
+# Which pod is eating memory — check if it's growing (leak) or just large
+# Get pod's node assignment
+kubectl get pods -A -o wide | grep <node-name>
+```
+
+**Step 3: Immediate actions — stop the bleeding**
+
+**Option A: Drain the node** — if one node is under pressure, move its pods elsewhere:
+```bash
+kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
+```
+This evicts pods gracefully (respecting PDBs and terminationGracePeriod) and reschedules them. Don't use this if all nodes are under pressure — you'll just move the problem.
+
+**Option B: Kill the memory hog** — if a specific pod is clearly leaking:
+```bash
+kubectl delete pod <pod-name> -n <namespace>
+# Deployment controller recreates it — fresh start with empty memory
+```
+
+**Option C: Emergency memory — free up system memory on the node** (last resort):
+```bash
+# SSH to the node
+sync && echo 3 > /proc/sys/vm/drop_caches   # Drops filesystem page cache
+```
+This frees cached memory that the kernel holds but doesn't actively need. Temporary relief, not a fix.
+
+**Step 4: Root cause — why did memory pressure occur?**
+
+**1. Memory leak in application:**
+Memory grows steadily over hours/days → hits node capacity → pressure. Check container-level memory trend in Grafana:
+```promql
+container_memory_working_set_bytes{pod=~"my-app.*"}
+```
+If the graph is a steady upward slope with no plateau, it's a leak. Fix: find the leak, set `limits.memory` to trigger OOMKill before it takes down the node.
+
+**2. Missing memory limits:**
+Pod has no `limits.memory` — it can consume all node memory without bound. K8s won't kill it until the node is in distress. Fix: always set memory limits. Enforce it with a LimitRange:
+```yaml
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: production
+spec:
+  limits:
+    - type: Container
+      default:
+        memory: 512Mi     # Applied if no limit is specified
+      defaultRequest:
+        memory: 256Mi
+      max:
+        memory: 2Gi       # Hard ceiling per container
+```
+
+**3. Over-scheduling — too many pods per node:**
+Scheduler places pods based on `requests`, not actual usage. If actual usage > requests, nodes get oversubscribed. A node with 8Gi memory can have 10 pods each requesting 512Mi (total requests: 5Gi) but actually using 900Mi each (total actual: 9Gi) → memory pressure.
+
+Fix: set requests to match actual p95 usage (use VPA recommendations), not a low number to squeeze more pods onto each node.
+
+**4. JVM / container runtime overhead:**
+Java apps with `-Xmx2g` use 2Gi heap + metaspace + GC overhead + thread stacks. Total process memory is typically 1.5-2x heap. Set limits accordingly: `-Xmx2g` → `limits.memory: 3Gi`.
+
+**Step 5: Prevention — alerts before pressure hits**
+
+```yaml
+# Prometheus alert — fire at 80% to give time to react before evictions start
+- alert: NodeMemoryHigh
+  expr: |
+    (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)
+    / node_memory_MemTotal_bytes > 0.80
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Node {{ $labels.node }} memory > 80%"
+
+# Alert on evicted pods immediately
+- alert: PodEvicted
+  expr: kube_pod_status_reason{reason="Evicted"} > 0
+  for: 0m
+  labels:
+    severity: critical
+```
+
+**Real scenario:** At 2 AM, 6 pods were evicted across 3 nodes — all from the same namespace. `kubectl top nodes` showed 3 nodes at 95%+ memory. `kubectl top pods` showed one pod using 6Gi with no limit set — it was a data processing job that loaded an entire dataset into memory. It had been running fine for months but the dataset grew past the node's available memory. No alert fired because we had no node memory alert, only pod-level alerts.
+
+Immediate fix: deleted the job pod, memory freed, evicted pods rescheduled. Permanent fix: added memory limits to the job (`limits.memory: 4Gi`), switched the job to stream data in chunks instead of loading it all at once (peak memory dropped from 6Gi to 400Mi), and added node memory alerts at 75% and 85%.
+
+---

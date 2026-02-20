@@ -1234,3 +1234,259 @@ helm package my-app/            # Packages chart into my-app-1.4.0.tgz for a cha
 **Real scenario:** A new engineer joined the team and asked "where do I change the number of replicas for prod?" Before Helm, the answer was "find the deployment YAML for that service in the prod folder." With our Helm chart structure, the answer is: "open `values-prod.yaml`, change `replicaCount`, raise a PR." The structure made the chart self-documenting — all tunable parameters live in `values.yaml` as a single reference. We also run `helm lint` and `helm template` in CI on every PR, so broken templates are caught before they ever reach the cluster.
 
 ---
+
+## 26. How do you reduce AWS cost in a Kubernetes-based production workload?
+
+Cost in a K8s workload on AWS comes from three places: **compute (nodes)**, **storage (EBS/EFS)**, and **networking (LBs, NAT, data transfer)**. Optimizing each one separately gives compounding savings.
+
+**1. Right-size node instances — biggest lever**
+
+The most common waste: teams over-provision nodes "to be safe" and pods request far more CPU/memory than they use.
+
+```bash
+# See actual vs requested for all pods
+kubectl top pods -A --sort-by=cpu
+kubectl top pods -A --sort-by=memory
+
+# VPA recommendations — actual usage-based sizing
+kubectl describe vpa <name>
+```
+
+We ran VPA in `Off` mode across all namespaces for 2 weeks. It showed 60% of our pods requested 4x more memory than they ever used. Correcting requests freed up 8 nodes on a 25-node cluster — $1,800/month savings.
+
+**2. Use Spot instances for stateless workloads**
+
+Spot instances cost 60-80% less than on-demand. For stateless services (APIs, workers, batch jobs), a spot interruption just reschedules the pod elsewhere — no data loss.
+
+```hcl
+# Karpenter NodePool — spot first, on-demand fallback
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: default
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]   # Spot preferred
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["m5.large", "m5.xlarge", "m4.large", "m4.xlarge"]  # Flexible types
+```
+
+Karpenter picks spot when available, falls back to on-demand automatically. We run 70% spot in production — compute cost dropped by ~55%.
+
+**3. Cluster autoscaling — scale down aggressively**
+
+Default scale-down is conservative. Tune it:
+```yaml
+# Cluster Autoscaler flags
+--scale-down-delay-after-add=5m       # Don't scale down right after scale-up
+--scale-down-unneeded-time=5m         # Node must be underutilized for 5 min before removal
+--scale-down-utilization-threshold=0.5 # Remove nodes using < 50% of requested resources
+```
+
+Combined with Karpenter's bin-packing, we reduced average node count from 30 to 18 during off-peak hours.
+
+**4. Consolidate LoadBalancers**
+
+Each `type: LoadBalancer` Service on AWS = one NLB at ~$18/month. Consolidate all HTTP/HTTPS traffic behind a single NGINX Ingress Controller:
+
+```
+Before: 20 services × $18 = $360/month
+After:  1 NLB + NGINX Ingress = $18/month
+```
+
+**5. NAT Gateway costs — often overlooked**
+
+NAT Gateway charges per GB of data processed. Pods pulling large Docker images, syncing to S3, or calling external APIs through NAT add up fast.
+
+Fixes:
+- Use **VPC Endpoints** for S3 and ECR — traffic stays on AWS backbone, no NAT charges
+- Use **ECR Pull Through Cache** — nodes pull images from ECR instead of Docker Hub through NAT
+- Enable **ECR VPC endpoint** — image pulls are free, no NAT data processing fee
+
+```bash
+# Create VPC endpoint for S3 (free, reduces NAT traffic)
+aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-xxx \
+  --service-name com.amazonaws.us-east-1.s3 \
+  --route-table-ids rtb-xxx
+```
+
+We had $400/month in NAT Gateway costs — mostly ECR image pulls. Adding the ECR VPC endpoint dropped it to $40/month overnight.
+
+**6. Delete orphaned resources**
+
+```bash
+# Unused PVCs (storage you're paying for but nothing uses)
+kubectl get pvc -A | grep -v Bound
+
+# Orphaned LoadBalancers (service deleted but LB still exists in AWS)
+kubectl get svc -A --field-selector spec.type=LoadBalancer
+
+# Old ReplicaSets with 0 pods (Deployments keep history)
+kubectl get rs -A | awk '$3 == 0 && $4 == 0'
+```
+
+We found 7 orphaned NLBs ($126/month) and 15 unused PVCs ($90/month) — both from resources deleted months ago without proper cleanup.
+
+**7. Use Kubecost for visibility**
+
+```bash
+helm install kubecost cost-analyzer \
+  --repo https://kubecost.github.io/cost-analyzer/ \
+  --namespace kubecost --create-namespace
+```
+
+Kubecost breaks down cost by namespace, deployment, and team. It shows which team is responsible for which spend. After deploying it, team leads could see their own costs — that social pressure alone reduced cluster-wide spend by 15% in one quarter.
+
+**Real scenario:** Our monthly EKS bill was $28,000. After a 3-week cost optimization sprint:
+- Right-sized pod requests → freed 8 nodes → **-$1,800/month**
+- Spot instances for stateless services → **-$6,000/month**
+- Consolidated 18 LBs to 1 Ingress → **-$306/month**
+- ECR + S3 VPC endpoints → **-$360/month**
+- Deleted orphaned PVCs and LBs → **-$216/month**
+- Total: **$28,000 → $19,300/month — 31% reduction** with zero application changes.
+
+---
+
+## 27. How do you design HPA for CPU and custom metrics?
+
+> **Also asked as:** "How would you implement HPA for CPU + custom metrics?"
+
+HPA (Horizontal Pod Autoscaler) can scale on three metric types: **resource metrics** (CPU, memory), **custom metrics** (app-level — request rate, queue depth), and **external metrics** (outside the cluster — SQS queue length, Pub/Sub backlog).
+
+**Basic CPU-based HPA:**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70   # Scale up when avg CPU across pods > 70%
+```
+
+**Prerequisite:** Pods must have `resources.requests.cpu` defined. HPA calculates: `current usage / requested CPU × 100`. Without requests, the denominator is zero — HPA shows `<unknown>` and never scales.
+
+**Adding custom metrics — request rate via Prometheus:**
+
+The Prometheus Adapter translates Prometheus metrics into the K8s custom metrics API (`custom.metrics.k8s.io`).
+
+```bash
+# Install Prometheus Adapter
+helm install prometheus-adapter prometheus-community/prometheus-adapter \
+  --set prometheus.url=http://prometheus.monitoring.svc
+```
+
+Define which Prometheus metric to expose:
+```yaml
+# Prometheus Adapter config
+rules:
+  custom:
+    - seriesQuery: 'http_requests_total{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: "namespace"}
+          pod: {resource: "pod"}
+      name:
+        matches: "^(.*)_total"
+        as: "${1}_per_second"
+      metricsQuery: 'rate(<<.Series>>{<<.LabelMatchers>>}[2m])'
+```
+
+Now use it in HPA alongside CPU:
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: my-app-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: my-app
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "1000"   # Scale up when avg req/sec per pod > 1000
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60    # React to spikes within 60 seconds
+      policies:
+        - type: Pods
+          value: 4                       # Add at most 4 pods per scaling event
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Wait 5 min before scaling down
+      policies:
+        - type: Percent
+          value: 25                      # Remove at most 25% of pods per event
+          periodSeconds: 120
+```
+
+**Verify HPA is reading metrics:**
+```bash
+kubectl get hpa my-app-hpa
+# NAME          REFERENCE        TARGETS                      MINPODS   MAXPODS   REPLICAS
+# my-app-hpa    Deployment/app   45%/70%, 800/1000            3         30        5
+
+kubectl describe hpa my-app-hpa
+# Look for: "AbleToScale: True", not "<unknown>"
+```
+
+**Scaling on external metrics — SQS queue depth:**
+
+```yaml
+- type: External
+  external:
+    metric:
+      name: sqs_messages_visible
+      selector:
+        matchLabels:
+          queue: order-processing
+    target:
+      type: AverageValue
+      averageValue: "100"   # 1 pod per 100 messages in queue
+```
+
+**Common design decisions:**
+
+| Decision | Recommendation |
+|---|---|
+| CPU target % | 60-70% — leaves headroom before throttling |
+| Scale-up window | 60s — react quickly to traffic spikes |
+| Scale-down window | 300s — avoid thrashing; don't scale down during transient dips |
+| minReplicas | ≥ 2 — always maintain HA, never go to 1 |
+| maxReplicas | Set a real ceiling based on capacity + cost, never unlimited |
+
+**Real scenario:** Our order-processing service scaled on CPU alone. During flash sales, CPU stayed low (orders were I/O-bound, mostly waiting on the database) but the SQS queue grew to 50,000 messages. HPA saw healthy CPU → didn't scale → queue backed up → orders delayed by 45 minutes. We switched to scaling on SQS queue depth — target 500 messages per pod. During the next flash sale, HPA scaled from 5 to 28 pods in 4 minutes, queue drained normally. CPU-only HPA is wrong for I/O-bound workloads.
+
+---
