@@ -107,6 +107,8 @@ Low CPU and stable memory is misleading — they're not the only bottlenecks. Wh
 
 ## 5. A service works in staging but fails in production. How do you narrow the difference without guessing?
 
+> **Also asked as:** "One job working fine in dev environment and not working in production — how will you troubleshoot?"
+
 I systematically diff the two environments. No guessing, no "maybe it's this."
 
 1. **Diff the manifests** — `kubectl get deploy <name> -n staging -o yaml` vs prod. Look for: different image tags, env vars, resource limits, ConfigMaps mounted. We once spent 2 hours debugging a prod failure. The root cause: staging had `LOG_LEVEL=debug` which happened to initialize a module that prod didn't (because `LOG_LEVEL=warn` skipped it). One env var difference changed the app's behavior completely.
@@ -205,6 +207,8 @@ I've managed production Kubernetes clusters on EKS for 3+ years. Let me walk you
 ---
 
 ## 9. If a pod loses connectivity, how do you find and fix the issue?
+
+> **Also asked as:** "One pod not reachable to other pod in Kubernetes"
 
 "Pod lost connectivity" could mean: pod can't reach other pods, can't reach Services, can't reach external internet, or external users can't reach the pod. I narrow it down immediately.
 
@@ -598,8 +602,9 @@ kubectl exec <pod> -- ls -la /app     # Does the user own the files?
 ```
 
 Fix in Dockerfile:
+
 ```dockerfile
-COPY --chown=appuser:appuser . /app
+COPY --chown=appuser:appuser scenario-based /app
 USER appuser
 ```
 

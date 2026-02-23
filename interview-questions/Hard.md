@@ -676,3 +676,688 @@ Most companies set SLAs at 99.5% or 99% even when their SLOs are 99.9%, specific
 **Real scenario:** Our payments team had no SLOs — just a vague "keep it up." During a 90-minute incident, the product team kept pushing new features mid-incident because they didn't know reliability was at risk. After defining SLOs (99.95% availability, p99 < 300ms), we set an error budget of 21.6 minutes/month. The first month, we burned 18 minutes in a single incident — 83% of our budget in one event. That data made the case for a feature freeze and a two-sprint reliability investment. No SLO → nobody knows the cost of incidents. SLO → the cost is visible, measurable, and actionable.
 
 ---
+
+## 12. What happens to a Pod when its initContainer fails with restartPolicy: Never?
+
+The Pod enters `Failed` phase permanently. No retries. No restarts. The main container never starts.
+
+`restartPolicy: Never` applies to the **Pod**, not just the main container. When an initContainer fails under this policy, kubelet marks the Pod as `Failed` and stops all further action on it. The Pod object stays in the cluster in `Failed` state until you delete it.
+
+```bash
+kubectl get pod <pod-name>
+# STATUS: Error  (not CrashLoopBackOff — no retries happen)
+
+kubectl describe pod <pod-name>
+# Init Containers:
+#   init-db-check:
+#     State: Terminated
+#     Reason: Error
+#     Exit Code: 1
+# Events:
+#   Warning  Failed  pod failed to start because init container failed
+```
+
+**Contrast with other restartPolicy values:**
+
+| restartPolicy | initContainer fails | Behaviour |
+|---|---|---|
+| `Always` | Retries the initContainer with backoff (10s→20s→40s...) → CrashLoopBackOff if keeps failing |
+| `OnFailure` | Same as Always for failed exit codes — retries with backoff |
+| `Never` | Pod immediately enters `Failed` state. No retries. Ever. |
+
+**Why this matters in practice:**
+
+`restartPolicy: Never` is common on Jobs and batch Pods. If your init container checks a database migration status or waits for a dependency, and it fails — the Job Pod is done. The Job controller (not kubelet) decides whether to create a new Pod based on `backoffLimit`.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+spec:
+  backoffLimit: 3       # Job controller creates up to 3 new Pods on failure
+  template:
+    spec:
+      restartPolicy: Never   # Each Pod attempt: no retries, fail fast
+      initContainers:
+        - name: wait-for-db
+          image: busybox
+          command: ['sh', '-c', 'nc -z postgres 5432 || exit 1']
+      containers:
+        - name: migrate
+          image: my-app:v1
+          command: ['./run-migrations.sh']
+```
+
+If `wait-for-db` fails → Pod goes `Failed` → Job controller creates a new Pod (up to `backoffLimit: 3`).
+
+**Real scenario:** A migration Job kept creating new Pods and failing. On-call engineer saw 4 Pods in `Error` state, assumed the app was broken. Root cause: the initContainer was checking `nc -z postgres 5432` — the database was up, but the port check used the wrong service name (`postgres` instead of `postgres-service`). With `restartPolicy: Never`, each attempt failed immediately and the Job exhausted its `backoffLimit` in under a minute. The fix was correcting the service name. Understanding that `Never` = zero retries per Pod helped us focus on the init container immediately instead of debugging the main app.
+
+---
+
+## 13. If you delete pod-0 from a StatefulSet, do the other pods get renamed?
+
+**No.** The other pods keep their exact names. Only the deleted pod is recreated — with the same name it had before.
+
+StatefulSet pod names follow the pattern `<statefulset-name>-<ordinal>`. Ordinals are fixed identities, not positions. Deleting `pod-0` does not shift `pod-1` to `pod-0`. Instead, the StatefulSet controller recreates a new `pod-0` from scratch — same name, same PVC, same DNS hostname.
+
+```bash
+# StatefulSet with 3 pods: kafka-0, kafka-1, kafka-2
+kubectl delete pod kafka-0
+
+kubectl get pods -w
+# kafka-0   0/1   Terminating   0   2m
+# kafka-0   0/1   Pending       0   0s    ← new pod-0 being created
+# kafka-0   0/1   Init:0/1      0   1s
+# kafka-0   1/1   Running       0   15s   ← same name, same PVC
+
+# kafka-1 and kafka-2 are NEVER touched
+```
+
+**Why this design exists:**
+
+StatefulSet pods have stable identity by design. Each pod has:
+- A stable hostname: `kafka-0.kafka-headless.default.svc.cluster.local`
+- A bound PVC: `data-kafka-0` (follows the pod, not the node)
+- A fixed ordinal that other cluster members know about (e.g., Kafka broker ID = 0)
+
+If renaming happened on delete, the Kafka cluster would lose broker-0's identity, the PVC would become orphaned, and other brokers would have no way to re-establish replication. The whole point of StatefulSet is that identity is permanent.
+
+**What does change:**
+- The Pod gets a new IP address (it's a new Pod object)
+- It starts fresh (container restarts, no in-memory state)
+- But it reconnects to the same PVC with all its data intact
+
+**Common confusion:** People expect StatefulSets to behave like arrays where deleting index 0 shifts everything down. They don't. Think of StatefulSet pods as named servers, not numbered slots.
+
+**Real scenario:** A junior engineer deleted `elasticsearch-0` to "force a fresh start" on a misbehaving pod. They expected `elasticsearch-1` to become the new primary. Instead, `elasticsearch-0` came back as itself — and since it had the same PVC with potentially corrupted index data, it was still misbehaving. The right approach was to identify the actual problem (corrupted shard), delete the PVC along with the pod (`kubectl delete pod elasticsearch-0 && kubectl delete pvc data-elasticsearch-0`), and let the StatefulSet create a fresh `elasticsearch-0` with a new empty PVC that would re-sync from the other nodes.
+
+---
+
+## 14. Does a DaemonSet automatically tolerate NoSchedule taints on master/control-plane nodes?
+
+**Yes — but only for specific system taints, and only for DaemonSets created by Kubernetes itself or with the right tolerations.**
+
+Kubernetes automatically adds tolerations to DaemonSet pods for these taints:
+
+```yaml
+# K8s automatically adds these tolerations to ALL DaemonSet pods:
+tolerations:
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+  - key: node.kubernetes.io/disk-pressure
+    operator: Exists
+    effect: NoSchedule
+  - key: node.kubernetes.io/memory-pressure
+    operator: Exists
+    effect: NoSchedule
+  - key: node.kubernetes.io/pid-pressure
+    operator: Exists
+    effect: NoSchedule
+  - key: node.kubernetes.io/unschedulable
+    operator: Exists
+    effect: NoSchedule
+```
+
+**For control-plane nodes specifically:**
+
+Control-plane nodes have this taint by default:
+```
+node-role.kubernetes.io/control-plane:NoSchedule
+```
+
+DaemonSets do **NOT** automatically tolerate this. If you want your DaemonSet to run on control-plane nodes, you must add the toleration explicitly:
+
+```yaml
+spec:
+  template:
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+```
+
+**Why the distinction matters:**
+
+System DaemonSets like `kube-proxy` and `aws-node` (VPC CNI) need to run on every node including control-plane — so they include this toleration explicitly. Your custom DaemonSets (Promtail, Datadog, Falco) will NOT run on control-plane nodes unless you add it.
+
+**Real scenario:** We deployed Falco (security monitoring) as a DaemonSet to watch syscalls on every node. After deployment, `kubectl get pods -n falco -o wide` showed Falco running on all 8 worker nodes but not on the 3 control-plane nodes. An attacker who gained access to a control-plane node would be invisible to Falco. We added the control-plane toleration to the Falco DaemonSet. After that, Falco ran on all 11 nodes — worker and control-plane — giving us complete cluster coverage.
+
+---
+
+## 15. You push a new image tag mid-rollout. What does Kubernetes do — wait or start fresh?
+
+**Kubernetes starts a fresh rollout immediately.** The in-progress rollout is abandoned and a new one begins from wherever the current state is.
+
+Here's exactly what happens internally:
+
+1. You have a Deployment rolling from `v1` → `v2`. Halfway through: 3 `v2` pods running, 3 `v1` pods still running.
+2. You run `kubectl set image deployment/my-app app=my-app:v3`
+3. The Deployment controller computes a new pod template hash for `v3`
+4. A **new ReplicaSet** is created for `v3`
+5. The `v2` ReplicaSet (partially scaled up) starts scaling **down**
+6. The `v3` ReplicaSet starts scaling **up**
+7. The `v1` ReplicaSet (if not yet fully scaled down) also continues scaling down
+
+```bash
+kubectl get rs -w
+# NAME                    DESIRED   CURRENT   READY
+# my-app-v1-hash          0         2         2     ← still scaling down
+# my-app-v2-hash          0         3         3     ← abandoned, now scaling down
+# my-app-v3-hash          6         4         2     ← new rollout taking over
+```
+
+**The old rollout is NOT waited for or completed — it is superseded.**
+
+```bash
+kubectl rollout history deployment/my-app
+# REVISION  CHANGE-CAUSE
+# 1         my-app:v1
+# 2         my-app:v2   ← this revision exists but was never fully deployed
+# 3         my-app:v3   ← current target
+```
+
+**What this means for rollback:**
+
+`kubectl rollout undo` by default goes to revision 2 — the partially deployed `v2`. If `v2` was the broken image, rolling back to it is wrong. Always check `kubectl rollout history` before undoing and specify the revision explicitly:
+
+```bash
+kubectl rollout undo deployment/my-app --to-revision=1   # Go back to v1
+```
+
+**Real scenario:** During an incident, an engineer pushed a hotfix image (`v2.1-hotfix`) while the initial `v2.1` rollout was still in progress. The Deployment started a new rollout for the hotfix immediately. Three ReplicaSets existed simultaneously — the old `v2.0`, the incomplete `v2.1`, and the new `v2.1-hotfix`. During the chaos, `kubectl rollout undo` was run and accidentally landed on the incomplete `v2.1` (which had the bug) instead of `v2.0`. After this incident, we added a policy: mid-rollout image pushes are prohibited. All rollouts must complete or be fully rolled back before a new image is pushed.
+
+---
+
+## 16. Can two containers in the same Pod bind to the same port?
+
+**No.** They share the same network namespace, which means they share the same IP address and the same port space. Two processes cannot bind to the same port on the same IP — this is a fundamental OS networking constraint, not a Kubernetes limitation.
+
+```yaml
+# This will FAIL at runtime — port 8080 conflict
+spec:
+  containers:
+    - name: app
+      image: my-app:v1
+      ports:
+        - containerPort: 8080   # app binds to :8080
+    - name: sidecar
+      image: my-sidecar:v1
+      ports:
+        - containerPort: 8080   # also tries to bind :8080 → FAILS
+```
+
+The second container to start will get `address already in use` and crash. The `ports` field in a pod spec is purely informational — Kubernetes does not enforce or validate it. The OS enforces it at bind time.
+
+**What containers in the same Pod CAN do:**
+
+- Communicate via `localhost` — container A calls `localhost:8080` to reach container B
+- Share volumes mounted at the same path
+- See each other's processes (if `shareProcessNamespace: true`)
+
+```yaml
+# Correct pattern — different ports
+spec:
+  containers:
+    - name: app
+      image: my-app:v1      # listens on :8080
+    - name: envoy-proxy
+      image: envoy:v1       # listens on :9901 (admin), :15001 (traffic)
+```
+
+**Real scenario:** A team added an Nginx sidecar to an existing pod for request buffering. Both the main app and Nginx were configured to listen on port 80. The main app started first, bound to `:80` successfully. Nginx started second, failed with `bind: address already in use`, and the pod entered CrashLoopBackOff. The fix: changed Nginx to listen on `:8080` and updated the Service `targetPort` accordingly. The `ports` declaration in the pod spec showed both containers listing port 80 with no warning from Kubernetes — the conflict only appeared at runtime.
+
+---
+
+## 17. HPA metrics server goes down during a traffic spike. What happens to scaling?
+
+**HPA stops scaling — in either direction.** It does not scale up to handle the spike, and it does not scale down existing replicas. The current replica count is frozen until metrics become available again.
+
+Specifically: when the metrics server is unavailable, HPA enters a state where it cannot compute the desired replica count. The HPA controller uses a **last-known-good** approach — it keeps the current replica count unchanged rather than making a scaling decision with no data.
+
+```bash
+kubectl describe hpa my-app-hpa
+# Conditions:
+#   AbleToScale     True    ReadyForNewScale
+#   ScalingActive   False   FailedGetScale
+#     message: the HPA was unable to compute the replica count:
+#              unable to get metrics for resource cpu: unable to fetch metrics from resource metrics API
+```
+
+**What this means in practice:**
+
+- If you had 5 replicas when metrics server went down → you stay at 5 replicas
+- Traffic spikes → no new pods are added → existing 5 pods get overloaded
+- Traffic drops → no pods are removed → you keep paying for 5 pods
+
+**The dangerous scenario:**
+
+If metrics server goes down *after* a scale-up event (say you're at 20 replicas during a spike), and then traffic drops, HPA cannot scale back down. You stay at 20 replicas — paying for 20 pods — until metrics are restored.
+
+**How to protect against this:**
+
+```yaml
+# Set a reasonable default replica count — not 1
+spec:
+  minReplicas: 3    # Even with no metrics, you always have 3 pods
+  maxReplicas: 30
+```
+
+```yaml
+# Alert on metrics server unavailability
+- alert: MetricsServerDown
+  expr: absent(up{job="metrics-server"}) == 1
+  for: 2m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Metrics server is down — HPA is blind"
+```
+
+**Also alert on HPA scaling failures:**
+```promql
+kube_horizontalpodautoscaler_status_condition{
+  condition="ScalingActive",
+  status="false"
+} == 1
+```
+
+**Real scenario:** Our metrics-server pod was evicted during a node pressure event at peak traffic. HPA froze at 8 replicas. Traffic continued growing — p99 latency went from 120ms to 4 seconds. Nobody noticed metrics-server was down because we had no alert for it. We only found out when manually checking HPA status 20 minutes into the incident. After restoring metrics-server, HPA scaled to 22 replicas within 3 minutes and latency recovered. After the incident: added metrics-server to a dedicated node with `priorityClass: system-cluster-critical` so it never gets evicted, and added an alert for HPA scaling failures.
+
+---
+
+## 18. What actually happens to mounted tokens when you delete a ServiceAccount?
+
+**Pods that already have the token mounted continue running — the token file in the pod is not deleted.** But the token becomes invalid immediately for new API calls, because the ServiceAccount no longer exists in the API server.
+
+**Two token types — different behaviour:**
+
+**Legacy auto-mounted tokens (pre-K8s 1.24):**
+- Stored as a Secret of type `kubernetes.io/service-account-token`
+- Mounted into the pod at `/var/run/secrets/kubernetes.io/serviceaccount/token`
+- When you delete the ServiceAccount, the Secret is garbage-collected
+- The file in the running pod's filesystem remains (it was already written to the container's volume)
+- But any API call using that token gets `401 Unauthorized` — the token references a deleted SA
+
+**Bound service account tokens (K8s 1.24+, default now):**
+- Generated per-pod with an expiry (default 1 hour)
+- Not stored as a Secret — issued directly by the token API
+- Deleting the ServiceAccount immediately invalidates all bound tokens for that SA
+- Running pods lose API access on their next token use
+
+```bash
+# Check what token a pod is using
+kubectl exec <pod> -- cat /var/run/secrets/kubernetes.io/serviceaccount/token | \
+  cut -d. -f2 | base64 -d 2>/dev/null | jq .
+
+# Test if the token still works
+kubectl exec <pod> -- \
+  curl -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+  https://kubernetes.default.svc/api --insecure
+# Returns 401 if SA is deleted
+```
+
+**What breaks when the SA is deleted:**
+
+- Pod cannot list/watch/create K8s resources (if it was using the SA for API access)
+- Operators and controllers that use SA tokens to manage resources fail
+- Anything calling the K8s API from inside the pod gets 401
+
+**What does NOT break:**
+
+- The pod itself keeps running — kubelet does not kill it
+- Non-K8s API calls (database, external APIs) are unaffected
+- The pod's network and filesystem remain intact
+
+**Real scenario:** A developer deleted a ServiceAccount named `monitoring-sa` while cleaning up "unused" resources. They checked — no pods were using it directly in their namespace. What they missed: Prometheus was running in the `monitoring` namespace using that exact SA to scrape metrics from pods across all namespaces via ClusterRoleBinding. Within 60 seconds, Prometheus started getting 401s on all cross-namespace scrape targets. All metrics went flat. Alerts stopped firing (Alertmanager pulls from Prometheus). We had no monitoring for 25 minutes until we recreated the SA and re-bound the ClusterRoleBinding. Added a policy after: ServiceAccounts referenced in ClusterRoleBindings cannot be deleted without peer review.
+
+---
+
+## 19. Can strict anti-affinity rules cause a permanent scheduling deadlock?
+
+**Yes.** If every pod in a Deployment requires `requiredDuringSchedulingIgnoredDuringExecution` anti-affinity and there are not enough nodes to satisfy the constraint, new pods will never schedule — they stay `Pending` permanently.
+
+**Classic deadlock scenario:**
+
+```yaml
+# 3 replicas, each must be on a different node — fine with 3+ nodes
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: my-app
+        topologyKey: kubernetes.io/hostname   # different physical node
+```
+
+This works when you have 3+ nodes. But if a node goes down and you only have 2 nodes left:
+- 2 existing pods are on node-A and node-B ✅
+- The replacement pod for the failed node tries to schedule
+- node-A: already has `app=my-app` → anti-affinity blocks it
+- node-B: already has `app=my-app` → anti-affinity blocks it
+- **Result: pod stuck Pending indefinitely**
+
+```bash
+kubectl describe pod <pending-pod>
+# Events:
+#   Warning  FailedScheduling  0/2 nodes available:
+#   2 node(s) didn't match pod anti-affinity rules
+```
+
+**Another deadlock: circular dependency**
+
+Pod A has anti-affinity against Pod B. Pod B has anti-affinity against Pod A. Both are `Pending` — neither can schedule because the other isn't running yet but the constraint checks existing pods.
+
+Actually this specific case resolves (if no pods exist yet, the constraint is satisfied). The real deadlock is node-count-based.
+
+**How to avoid:**
+
+```yaml
+# Use preferred instead of required — soft constraint, won't deadlock
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: my-app
+          topologyKey: kubernetes.io/hostname
+```
+
+Or combine required with a higher `minReplicas` buffer:
+```yaml
+# If you have 5 nodes, keep maxReplicas ≤ 5 for required anti-affinity
+spec:
+  replicas: 3
+  # maxReplicas in HPA: 5 — never exceed node count
+```
+
+**Real scenario:** We ran Elasticsearch with `required` anti-affinity across 3 nodes. During a node upgrade, we cordoned node-3 (making it unschedulable) and drained it. The ES pod from node-3 tried to reschedule — but node-1 and node-2 already had ES pods. It sat `Pending` for 40 minutes blocking the entire cluster upgrade process. Fix: uncordon node-3, let the ES pod come back, finish the upgrade on node-3 last. Long-term fix: switched to `preferred` anti-affinity and added a fourth node so the constraint would always be satisfiable.
+
+---
+
+## 20. With ReadWriteOnce access mode, can multiple Pods on the same node use the same PVC simultaneously?
+
+**Yes — multiple pods on the same node can mount a ReadWriteOnce PVC simultaneously.** The "Once" in ReadWriteOnce means once per node, not once per pod.
+
+`ReadWriteOnce` (RWO) means: the volume can be mounted as read-write by a **single node**. Multiple pods on that same node can all mount it concurrently.
+
+```
+Node-A:
+  pod-1  ┐
+  pod-2  ├── all mount pvc-data (RWO) → ✅ works
+  pod-3  ┘
+
+Node-B:
+  pod-4 → tries to mount pvc-data (RWO) → ❌ blocked (already bound to Node-A)
+```
+
+**Access modes summary:**
+
+| Mode | Abbreviation | Meaning |
+|---|---|---|
+| `ReadWriteOnce` | RWO | Read-write by **one node** (multiple pods on same node: OK) |
+| `ReadOnlyMany` | ROX | Read-only by **many nodes** simultaneously |
+| `ReadWriteMany` | RWX | Read-write by **many nodes** simultaneously (NFS, EFS) |
+| `ReadWriteOncePod` | RWOP | Read-write by **one pod only** (K8s 1.22+) |
+
+**If you want truly single-pod access — use `ReadWriteOncePod`:**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: exclusive-storage
+spec:
+  accessModes:
+    - ReadWriteOncePod    # Only one pod in the entire cluster can mount this
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+With `ReadWriteOncePod`, if a second pod tries to mount the PVC while the first pod is running, the second pod stays `Pending` with a clear error.
+
+**Real scenario:** A team ran a StatefulSet with `ReadWriteOnce` PVCs, assuming each pod exclusively owned its volume. During a rolling update, the new pod was scheduled on the same node as the old (terminating) pod. For a brief window, both the old and new pod had the same PVC mounted. The old pod was still writing while the new pod started reading — causing data corruption in an append-only log file. The fix: switched to `ReadWriteOncePod` so the new pod stays `Pending` until the old pod fully terminates and releases the volume.
+
+---
+
+## 21. A NetworkPolicy only has ingress rules defined. Is egress still open?
+
+**Yes — egress is completely open** if no egress rules are defined in any NetworkPolicy that selects the pod.
+
+NetworkPolicy uses an **explicit opt-in model**. A NetworkPolicy only restricts the traffic types it explicitly declares. If a policy only specifies `policyTypes: [Ingress]`, egress is untouched. If no NetworkPolicy at all selects the pod, both ingress and egress are fully open.
+
+```yaml
+# This policy ONLY restricts ingress — egress is completely open
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+    - Ingress       # Only ingress is controlled
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+```
+
+**The pod selected by this policy:**
+- Ingress: only `app=frontend` pods can reach it ✅ (restricted)
+- Egress: can connect to anything, anywhere ✅ (unrestricted)
+
+**How default-deny works for both directions:**
+
+```yaml
+# Default deny ALL ingress AND egress in a namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}       # Selects ALL pods in the namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress or egress rules = deny everything
+```
+
+**The trap — forgetting to include `policyTypes`:**
+
+```yaml
+# BAD — policyTypes not specified
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - from: [...]
+# Result: only ingress is restricted, egress is open
+# This is the DEFAULT behaviour when policyTypes is omitted and only ingress rules exist
+```
+
+**Real scenario:** We applied a NetworkPolicy to restrict ingress to our payment service — only the API gateway could reach it. Security audit passed. Three months later, a penetration tester pointed out that any compromised pod in the namespace could make outbound calls to external IPs (C2 servers, data exfiltration endpoints) — because we never restricted egress. Our NetworkPolicy had locked the front door but left the back door wide open. Fix: added explicit egress rules allowing only necessary outbound traffic (DNS on 53, PostgreSQL on 5432, Stripe API) and a default-deny-egress policy for the namespace.
+
+---
+
+## 22. etcd performance is degrading. What metric tells you the real root cause?
+
+The single most important metric is **`etcd_disk_wal_fsync_duration_seconds`** — the time it takes etcd to fsync its write-ahead log to disk.
+
+etcd is a consensus database. Every write (pod creation, configmap update, secret change) must be committed to disk via fsync before etcd acknowledges it. If fsync is slow, everything is slow — the API server queues up, kubectl commands hang, controllers can't reconcile.
+
+```promql
+# P99 WAL fsync duration — should be < 10ms
+histogram_quantile(0.99,
+  rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])
+)
+
+# P99 backend commit duration (BoltDB writes) — should be < 25ms
+histogram_quantile(0.99,
+  rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])
+)
+```
+
+| Metric value | Meaning |
+|---|---|
+| WAL fsync p99 < 10ms | Healthy — disk is fast enough |
+| WAL fsync p99 10–50ms | Warning — disk under pressure, API latency increasing |
+| WAL fsync p99 > 100ms | Critical — API server will time out, cluster feels unresponsive |
+
+**Other key etcd metrics to check:**
+
+```promql
+# Leader elections — should be 0 in a stable cluster
+etcd_server_leader_changes_seen_total
+
+# Database size — default quota is 8GB, approaching it causes "mvcc: database space exceeded"
+etcd_mvcc_db_total_size_in_bytes
+
+# Active clients — sudden spike means controllers are reconnecting (instability signal)
+etcd_server_client_requests_total
+
+# Proposal failures — should be near 0
+etcd_server_proposals_failed_total
+```
+
+**Root cause diagnosis by metric:**
+
+| Symptom | Metric | Root cause |
+|---|---|---|
+| Slow API calls | High WAL fsync duration | Disk IOPS too low (gp2 vs gp3) |
+| Cluster instability | Leader changes > 0 | Network latency between etcd nodes or disk pressure causing missed heartbeats |
+| "database space exceeded" errors | DB size near 8GB | Too many revisions, need compaction |
+| Controllers stuck | High proposal failures | etcd quorum lost (node down) |
+
+**The most common fix — disk upgrade:**
+
+```bash
+# On AWS: migrate etcd EBS volume from gp2 to gp3 with higher IOPS
+aws ec2 modify-volume \
+  --volume-id vol-xxx \
+  --volume-type gp3 \
+  --iops 3000 \
+  --throughput 125
+```
+
+etcd docs recommend dedicated SSDs with at least 2000 IOPS. A gp2 volume on a small disk (default 100 IOPS) will cause API server degradation under any meaningful cluster activity.
+
+**etcd compaction — fix database size:**
+```bash
+# Compact old revisions (keeps only the last 1000)
+etcdctl compact $(etcdctl endpoint status --write-out="json" | jq '.[0].Status.header.revision')
+
+# Defragment to reclaim space
+etcdctl defrag --endpoints=https://127.0.0.1:2379
+```
+
+**Real scenario:** Our cluster API latency jumped from 50ms to 8 seconds overnight. `kubectl` commands took 10-15 seconds. `kube_apiserver_request_duration_seconds` was high but that's a symptom, not a cause. Checking `etcd_disk_wal_fsync_duration_seconds` showed p99 at 320ms — 30x above the healthy threshold. The etcd nodes were on gp2 EBS volumes that had grown to 200GB (baseline IOPS scales with size on gp2 but only to a point). We migrated to gp3 with 3000 provisioned IOPS. WAL fsync dropped to 4ms within minutes. API latency returned to 50ms. The WAL fsync metric pointed directly at the root cause — without it we would have kept tuning API server flags and getting nowhere.
+
+---
+
+## 23. How do you enforce that all images come only from your internal registry?
+
+Use **Kyverno** (or OPA/Gatekeeper) to validate every Pod at admission time. Any pod using an image not from your approved registry is rejected before it even reaches the scheduler.
+
+**Kyverno policy — block non-approved registries:**
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+spec:
+  validationFailureAction: Enforce    # Reject — not just warn
+  background: true                    # Also audit existing resources
+  rules:
+    - name: validate-registries
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "Images must come from 123456789.dkr.ecr.us-east-1.amazonaws.com only."
+        pattern:
+          spec:
+            containers:
+              - image: "123456789.dkr.ecr.us-east-1.amazonaws.com/*"
+            initContainers:
+              - image: "123456789.dkr.ecr.us-east-1.amazonaws.com/*"
+            ephemeralContainers:
+              - image: "123456789.dkr.ecr.us-east-1.amazonaws.com/*"
+```
+
+**Also block `latest` tag:**
+
+```yaml
+    - name: disallow-latest-tag
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "The 'latest' image tag is not allowed. Use a specific version tag."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
+```
+
+**Test the policy before enforcing:**
+
+```bash
+# Start in Audit mode — logs violations but doesn't block
+validationFailureAction: Audit
+
+# Check what would have been blocked
+kubectl get policyreport -A
+
+# Once violations are resolved, switch to Enforce
+validationFailureAction: Enforce
+```
+
+**Add image signing verification (next layer):**
+
+Even if the image is from your registry, it might have been pushed manually (bypassing CI). Combine registry restriction with Cosign signature verification:
+
+```yaml
+    - name: verify-image-signature
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      verifyImages:
+        - imageReferences:
+            - "123456789.dkr.ecr.us-east-1.amazonaws.com/*"
+          attestors:
+            - entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subject: "https://github.com/your-org/*"
+```
+
+This enforces: image must be from our ECR AND signed by our GitHub Actions pipeline. Manual pushes — even to our own registry — are blocked.
+
+**Verify the policy works:**
+
+```bash
+# Try to deploy a Docker Hub image — should be rejected
+kubectl run test --image=nginx:latest
+# Error from server: admission webhook "kyverno-resource-validating-webhook.kyverno.svc" denied:
+# Images must come from 123456789.dkr.ecr.us-east-1.amazonaws.com only.
+```
+
+**Real scenario:** A developer was debugging a production issue at midnight and ran `kubectl run debug --image=ubuntu:latest` in the prod namespace to get a shell. The container started successfully (we had no policy). From inside `ubuntu`, they installed tools and made network calls to diagnose the issue — but ubuntu has known vulnerabilities and was never scanned. After implementing this Kyverno policy, the same command returns an immediate rejection. Debugging is now done using a hardened debug image in our ECR: `123456789.dkr.ecr.us-east-1.amazonaws.com/debug-tools:latest` — scanned, minimal, and logged.
+
+---

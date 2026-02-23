@@ -52,12 +52,13 @@ I go layer by layer, outside-in. The trick is to **narrow down whether the issue
 Three pieces: **Dockerfile**, **Kubernetes manifest**, and **CI/CD pipeline**. I'll walk through each with what I'd actually use in production.
 
 **Dockerfile:**
+
 ```dockerfile
 FROM node:18-alpine
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --only=production
-COPY . .
+COPY medium .
 EXPOSE 3000
 USER node
 CMD ["node", "server.js"]
@@ -262,7 +263,7 @@ The deployment succeeded means K8s is happy — pods are running, the rollout co
 
 ## 9. What's the difference between metrics, logs, and traces, and when do you start with each?
 
-> **Also asked as:** "Describe Grafana and ELK/PLG stack to someone who doesn't know them" · "What monitoring and logging tools do you use?"
+> **Also asked as:** "Describe Grafana and ELK/PLG stack to someone who doesn't know them" · "What monitoring and logging tools do you use?" · "Explain logs, metrics and traces"
 
 These are the three pillars of observability. Each answers a different question:
 

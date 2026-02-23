@@ -154,6 +154,8 @@ When people say "the pod restarted," what actually happened is the **container i
 
 ## 6. Difference between readiness and liveness probes, and how each can break production.
 
+> **Also asked as:** "What is the difference between liveness and readiness probes?"
+
 Both are health checks, but they serve opposite purposes:
 
 **Liveness probe** — "Is this container alive?" If it fails, kubelet **kills and restarts** the container. Use this to recover from deadlocks, infinite loops, or stuck states where the app is running but can't serve requests.
@@ -234,7 +236,7 @@ startupProbe:
 
 ## 8. Why are StatefulSets useful, and how do they differ from Deployments?
 
-> **Also asked as:** "What is a StatefulSet in Kubernetes?" · "Explain the difference between a Deployment and a StatefulSet"
+> **Also asked as:** "What is a StatefulSet in Kubernetes?" · "Explain the difference between a Deployment and a StatefulSet" · "Kubernetes deployment vs StatefulSets"
 
 **Deployments** are for stateless apps — your API servers, frontends, workers. Every pod is identical and interchangeable. If pod-3 dies, a new pod is created with a random name (`app-7xk2f`) and can be scheduled anywhere. Pods don't have a fixed identity.
 
@@ -556,6 +558,8 @@ You run `kubectl apply -f deployment.yaml`:
 ---
 
 ## 14. What are the different Kubernetes deployment strategies?
+
+> **Also asked as:** "Explain the deployment strategy used in your organisation" · "How do you ensure zero-downtime deployments?"
 
 Four main strategies, each with different risk profiles:
 

@@ -76,7 +76,7 @@ Don't guess. Follow the money systematically — compute, then storage, then net
 
 ## 4. A pod is continuously restarting and entering CrashLoopBackOff. How would you troubleshoot it?
 
-> **Also asked as:** "How do you debug a container crash?" · "Your container keeps crashing — what do you check?"
+> **Also asked as:** "How do you debug a container crash?" · "Your container keeps crashing — what do you check?" · "Pod stuck in CrashLoopBackOff error — how will you troubleshoot?"
 
 CrashLoopBackOff means: container starts → crashes → K8s restarts it → crashes again → backoff delay increases (10s, 20s, 40s, up to 5 minutes). It's not an error itself — it's K8s telling you "I keep trying but this thing keeps dying."
 
@@ -363,5 +363,347 @@ Java apps with `-Xmx2g` use 2Gi heap + metaspace + GC overhead + thread stacks. 
 **Real scenario:** At 2 AM, 6 pods were evicted across 3 nodes — all from the same namespace. `kubectl top nodes` showed 3 nodes at 95%+ memory. `kubectl top pods` showed one pod using 6Gi with no limit set — it was a data processing job that loaded an entire dataset into memory. It had been running fine for months but the dataset grew past the node's available memory. No alert fired because we had no node memory alert, only pod-level alerts.
 
 Immediate fix: deleted the job pod, memory freed, evicted pods rescheduled. Permanent fix: added memory limits to the job (`limits.memory: 4Gi`), switched the job to stream data in chunks instead of loading it all at once (peak memory dropped from 6Gi to 400Mi), and added node memory alerts at 75% and 85%.
+
+---
+
+## 9. Pod is not scheduled due to resource constraints. How do you handle it?
+
+A pod stuck in `Pending` due to resource constraints means the scheduler looked at every node and couldn't find one that can satisfy the pod's requests. The pod exists as an API object but no node has accepted it. It will stay `Pending` indefinitely — K8s will not schedule it until something changes.
+
+**Step 1: Confirm the cause**
+
+```bash
+kubectl describe pod <pod-name>
+# Jump to Events section at the bottom — the scheduler always leaves a reason:
+# "0/5 nodes are available: 5 Insufficient cpu, 3 Insufficient memory"
+# "0/5 nodes are available: 5 node(s) had untolerated taint"
+# "0/5 nodes are available: 5 node(s) didn't match Pod's node affinity"
+```
+
+The Events section tells you exactly which constraint failed and on how many nodes.
+
+**Step 2: See actual available capacity**
+
+```bash
+# Current resource usage per node
+kubectl top nodes
+
+# Allocatable vs requested per node (what the scheduler sees)
+kubectl describe nodes | grep -A5 "Allocatable\|Allocated resources"
+```
+
+The scheduler uses `requests`, not actual usage. A node can be at 20% actual CPU but 95% requested — the scheduler sees it as nearly full and won't place new pods there.
+
+**Step 3: Identify the specific constraint and fix it**
+
+**Cause 1 — Cluster is genuinely full (most common)**
+
+All nodes are at or near their allocatable capacity. No room for the new pod.
+
+Fixes:
+```bash
+# Option A: Scale the node group (if cluster autoscaler is configured)
+# The autoscaler should do this automatically — check its logs:
+kubectl logs -n kube-system -l app=cluster-autoscaler | tail -50
+# Look for: "Scale-up: setting group size to X"
+
+# Option B: Manually increase the node group on EKS
+aws eks update-nodegroup-config \
+  --cluster-name my-cluster \
+  --nodegroup-name general \
+  --scaling-config minSize=3,maxSize=15,desiredSize=8
+
+# Option C: Add a new node manually (self-managed)
+# Provision a new node and join it to the cluster
+```
+
+**Cause 2 — Pod requests are too high**
+
+The pod requests more CPU or memory than any single node can provide. Even on an empty cluster, no node is big enough.
+
+```bash
+# Check what the pod is requesting
+kubectl get pod <pod-name> -o jsonpath='{.spec.containers[*].resources.requests}'
+
+# Check the largest allocatable on any node
+kubectl get nodes -o custom-columns=\
+"NAME:.metadata.name,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory"
+```
+
+If the pod requests `cpu: 8` and your largest node only has `7` allocatable CPU, it will never schedule. Fix: reduce the resource request to match actual need (use `kubectl top` from a previous run to check real usage).
+
+**Cause 3 — ResourceQuota exhausted in the namespace**
+
+The namespace has a `ResourceQuota` and the existing pods have already consumed the full allocation.
+
+```bash
+kubectl describe resourcequota -n <namespace>
+# Shows: Used vs Hard limit
+# Example:
+# requests.cpu    3900m / 4000m   ← only 100m left, new pod needs 500m → blocked
+```
+
+Fix: either increase the quota (requires cluster admin), or reduce requests on existing pods, or delete unused pods in the namespace.
+
+```yaml
+# Increase quota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: team-quota
+  namespace: payments
+spec:
+  hard:
+    requests.cpu: "8"         # increased from 4
+    requests.memory: 16Gi     # increased from 8Gi
+    pods: "40"
+```
+
+**Cause 4 — LimitRange sets a minimum higher than the pod's request**
+
+A `LimitRange` in the namespace enforces a minimum request. If the pod specifies less (or nothing), K8s injects the minimum — which may be too large to fit.
+
+```bash
+kubectl describe limitrange -n <namespace>
+# Shows min/max/default for containers
+```
+
+Fix: either update the pod to meet the minimum, or adjust the LimitRange.
+
+**Cause 5 — Node selector or affinity with no matching nodes**
+
+```bash
+kubectl describe pod <pod> | grep -A5 "Node-Selectors\|Affinity"
+# "Node-Selectors: disk=ssd"
+
+kubectl get nodes --show-labels | grep disk=ssd
+# No output — no node has this label
+```
+
+Fix: label the correct node, or remove/update the nodeSelector if it was applied by mistake.
+
+```bash
+kubectl label node <node-name> disk=ssd
+```
+
+**Cause 6 — Taint on all nodes with no matching toleration**
+
+```bash
+kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
+# All nodes show taint: gpu=true:NoSchedule
+
+# Pod has no toleration for it
+kubectl get pod <pod> -o jsonpath='{.spec.tolerations}'
+# empty
+```
+
+Fix: add the toleration to the pod spec, or remove the taint from the node if it was applied incorrectly.
+
+**Prevention — alert before users notice:**
+
+```yaml
+# Prometheus alert — pod stuck Pending for more than 5 minutes
+- alert: PodPendingTooLong
+  expr: kube_pod_status_phase{phase="Pending"} == 1
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Pod {{ $labels.pod }} has been Pending for > 5 minutes"
+```
+
+**Real scenario:** After a new microservice was onboarded, its pods sat `Pending` for 20 minutes. `kubectl describe pod` showed: `0/6 nodes are available: 6 Insufficient memory`. The new service had copy-pasted resource requests from a heavy batch job — `requests.memory: 4Gi` per pod, 3 replicas = 12Gi total. Our nodes were `m5.xlarge` with 16Gi total and ~12Gi allocatable (4Gi used by system + existing pods). No single node had 4Gi free.
+
+The service actually needed 400Mi based on load testing. We corrected the requests to `memory: 512Mi`, and all 3 pods scheduled immediately on existing nodes — no new nodes needed. The root cause was copy-pasted resource requests with no measurement behind them.
+
+---
+
+## 10. Pod is in CrashLoopBackOff but logs are empty. Where do you start?
+
+Empty logs mean the container is dying before it can write anything to stdout. Standard log debugging is useless — you need to work around the container's own output.
+
+**Step 1: Get the exit code — it tells you the category of failure**
+
+```bash
+kubectl describe pod <pod-name>
+# Look at Last State section:
+# Last State: Terminated
+#   Reason:    Error
+#   Exit Code: 127     ← command not found
+#   Exit Code: 137     ← OOMKilled or SIGKILL
+#   Exit Code: 126     ← permission denied on binary
+#   Exit Code: 1       ← generic app error (before any logging started)
+#   Exit Code: 139     ← segmentation fault
+```
+
+Exit code alone narrows the cause significantly before you do anything else.
+
+**Step 2: Check events and init containers**
+
+```bash
+kubectl describe pod <pod-name>
+# Events section — K8s-level failures that happen before the app starts:
+# - OOMKilled before first log line
+# - Failed to mount volume
+# - Failed to pull image layer
+# - Init container failed
+
+# Init containers have their own logs — people forget this
+kubectl logs <pod-name> -c <init-container-name>
+kubectl logs <pod-name> -c <init-container-name> --previous
+```
+
+**Step 3: Run the same image interactively**
+
+```bash
+# Run the exact same image but override the entrypoint with sleep
+kubectl run debug-pod \
+  --image=<same-image-as-failing-pod> \
+  --env="VAR1=value1" \
+  --command -- sleep 3600
+
+kubectl exec -it debug-pod -- sh
+
+# Now manually run the entrypoint inside the shell
+# Watch what error appears — it will be visible in your terminal
+/app/start.sh
+# → bash: /app/start.sh: Permission denied   (exit code 126)
+# → /app/start.sh: line 5: db-migrate: command not found  (exit code 127)
+```
+
+This bypasses the restart cycle and gives you interactive access to the exact failure.
+
+**Step 4: Check for OOMKill before first log line**
+
+If `Exit Code: 137` and logs are empty — the container was killed by the OOM killer before the app printed anything. This happens when the JVM or runtime itself exceeds the limit during startup.
+
+```bash
+# Check if memory limit is too tight for the runtime to even start
+kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].resources.limits.memory}'
+
+# Check node-level OOM events
+kubectl get events --field-selector reason=OOMKilling
+dmesg | grep -i "oom\|killed process"   # On the node via SSH
+```
+
+Fix: increase `limits.memory`. For JVMs, startup memory (loading classes, JIT compilation) peaks before the app is ready to log.
+
+**Step 5: Check volume mount failures**
+
+```bash
+kubectl describe pod <pod-name>
+# Events:
+# MountVolume.SetUp failed for volume "config" : configmap "app-config" not found
+# MountVolume.SetUp failed for volume "certs" : secret "tls-certs" not found
+```
+
+If a required volume can't be mounted, the container never starts — zero logs. The Events section catches this.
+
+**Common causes by exit code:**
+
+| Exit Code | Likely cause | First check |
+|---|---|---|
+| 137 | OOMKill or SIGKILL | Memory limit, `dmesg` on node |
+| 127 | Binary not found | Wrong CMD/ENTRYPOINT, missing binary in image |
+| 126 | Permission denied on binary | `chmod +x` missing, non-root user |
+| 139 | Segfault | Corrupt binary, architecture mismatch (ARM vs x86) |
+| 1 | Generic error before logging | Run interactively, check volume mounts |
+
+**Real scenario:** A new service entered CrashLoopBackOff on first deploy. Exit code 1, zero logs. The `kubectl run debug` approach revealed it immediately: the entrypoint script tried to source `/etc/app/env.sh` which was mounted from a ConfigMap — but the ConfigMap key was named `env.sh` and the mount was at `/etc/app/` but the file had Windows line endings (`\r\n`). Bash couldn't parse the script. The error was `$'\r': command not found` — which only appeared when running interactively. This would have been invisible in normal CrashLoopBackOff debugging.
+
+---
+
+## 11. Cluster Autoscaler is not scaling up despite Pending pods. What do you check first?
+
+Pending pods that don't trigger a scale-up is a deceptive problem — the autoscaler is running but silently deciding not to act. The reason is almost always one of five causes.
+
+**Step 1: Check autoscaler logs directly**
+
+```bash
+kubectl logs -n kube-system -l app=cluster-autoscaler --tail=100 | grep -i "scale\|pending\|cannot\|skip"
+```
+
+The autoscaler logs its decision for every pending pod. It will tell you exactly why it isn't scaling.
+
+**Step 2: The five causes and how to identify each**
+
+**Cause 1 — Pod has a `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` annotation AND is blocking a node from scale-down, not scale-up.** *(Not your issue here, but common confusion.)*
+
+**Cause 2 — No node group can satisfy the pod's requirements**
+
+The autoscaler only adds nodes from existing node groups. If your node group uses `m5.large` (2 CPU, 8GB RAM) but the pod requests 4 CPU, no new `m5.large` node will ever satisfy it. The autoscaler won't create a different instance type.
+
+```bash
+# What is the pod requesting?
+kubectl describe pod <pending-pod> | grep -A5 "Requests"
+
+# What instance types are in your node groups?
+aws eks describe-nodegroup --cluster-name my-cluster --nodegroup-name general \
+  --query 'nodegroup.instanceTypes'
+```
+
+Fix: add a node group with a larger instance type, or reduce the pod's resource requests.
+
+**Cause 3 — Node group is already at maxSize**
+
+```bash
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names <asg-name> \
+  --query 'AutoScalingGroups[0].{Max:MaxSize,Desired:DesiredCapacity}'
+
+# Autoscaler log will show:
+# "Skipping scale-up: node group <name> is at max size (10)"
+```
+
+Fix: increase `maxSize` on the ASG or in the autoscaler config.
+
+**Cause 4 — Pod has constraints no node in the group satisfies**
+
+NodeSelector, affinity rules, or tolerations that don't match any node in any node group:
+
+```bash
+kubectl describe pod <pending-pod>
+# Node-Selectors: gpu=true
+# But no node group has nodes with this label
+
+# Autoscaler log:
+# "Pod <pod> can't be scheduled on any node group"
+```
+
+Fix: add a node group that matches the pod's constraints, or fix the pod's constraints.
+
+**Cause 5 — Autoscaler expander is set to `least-waste` and decides no expansion is needed**
+
+The autoscaler calculates bin-packing efficiency. If it determines that the pending pod could theoretically fit on an existing node after other pods are shuffled — it won't scale up even if practically no node can accept the pod right now.
+
+```bash
+# Check expander setting
+kubectl get deployment cluster-autoscaler -n kube-system -o yaml | grep expander
+# --expander=least-waste   ← might cause this
+
+# Switch to priority or random expander for more predictable behavior
+--expander=priority
+```
+
+**Cause 6 — Scale-up cooldown is active**
+
+After a recent scale-up, autoscaler waits before scaling again (default `--scale-down-delay-after-add=10m`). There is also a scale-up stabilization. Check if a scale-up happened recently.
+
+```bash
+kubectl logs -n kube-system -l app=cluster-autoscaler | grep "ScaleUp"
+# "Scale-up: group was scaled up recently, cooldown period not expired"
+```
+
+**Verify once cause is fixed:**
+
+```bash
+# Watch autoscaler decisions in real time
+kubectl logs -n kube-system -l app=cluster-autoscaler -f | grep -i scale
+
+# Watch new node appear
+kubectl get nodes -w
+```
+
+**Real scenario:** After enabling a new namespace with GPU-bound ML workloads, all pods sat `Pending`. The autoscaler was running. Logs showed: `"No node group found for pod — all node groups have unsatisfied requirements"`. The GPU pods had `nodeSelector: hardware=gpu` but the GPU node group in the autoscaler config had nodes labeled `accelerator=nvidia`. The autoscaler correctly concluded that no node group could satisfy the pods — so it didn't scale. Fix: standardized the label to `hardware=gpu` across both the node group launch template and the pods. Autoscaler immediately triggered a scale-up and 2 GPU nodes were provisioned within 3 minutes.
 
 ---
