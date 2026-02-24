@@ -1361,3 +1361,252 @@ kubectl run test --image=nginx:latest
 **Real scenario:** A developer was debugging a production issue at midnight and ran `kubectl run debug --image=ubuntu:latest` in the prod namespace to get a shell. The container started successfully (we had no policy). From inside `ubuntu`, they installed tools and made network calls to diagnose the issue — but ubuntu has known vulnerabilities and was never scanned. After implementing this Kyverno policy, the same command returns an immediate rejection. Debugging is now done using a hardened debug image in our ECR: `123456789.dkr.ecr.us-east-1.amazonaws.com/debug-tools:latest` — scanned, minimal, and logged.
 
 ---
+
+## 24. How do you enforce tenant isolation in a multi-tenant Kubernetes setup?
+
+Multi-tenant K8s means multiple teams or customers share one cluster. Isolation has four layers: **namespace boundary**, **RBAC**, **network**, and **resource quotas**. Without all four, one tenant can affect another.
+
+**Layer 1: Namespace per tenant**
+
+Each tenant gets their own namespace. This is the logical boundary everything else attaches to.
+
+```bash
+kubectl create namespace tenant-a
+kubectl create namespace tenant-b
+```
+
+**Layer 2: RBAC — scoped to namespace**
+
+Each tenant's service account and users can only operate within their namespace. No cluster-wide permissions.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: tenant-a
+  name: tenant-a-developer
+rules:
+  - apiGroups: ["", "apps"]
+    resources: ["pods", "deployments", "services", "configmaps"]
+    verbs: ["get", "list", "create", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: tenant-a
+  name: tenant-a-developer-binding
+subjects:
+  - kind: User
+    name: alice@company.com
+roleRef:
+  kind: Role
+  name: tenant-a-developer
+  apiGroup: rbac.authorization.k8s.io
+```
+
+**Layer 3: NetworkPolicy — block cross-tenant traffic**
+
+By default pods in any namespace can talk to pods in any other namespace. Lock this down:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-cross-tenant
+  namespace: tenant-a
+spec:
+  podSelector: {}      # applies to all pods in tenant-a
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-a   # only allow from same namespace
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tenant-a
+    - to: {}           # allow egress to external (internet, databases)
+      ports:
+        - port: 443
+        - port: 53
+          protocol: UDP
+```
+
+**Layer 4: ResourceQuota + LimitRange — prevent noisy neighbour**
+
+One tenant doing a memory leak or running batch jobs shouldn't starve others.
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-a-quota
+  namespace: tenant-a
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+    persistentvolumeclaims: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-a-limits
+  namespace: tenant-a
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "4"
+        memory: 8Gi
+```
+
+**Layer 5: Pod Security Admission — prevent privilege escalation**
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-a
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+This blocks: privileged containers, hostNetwork, hostPID, running as root, capability escalation.
+
+**Layer 6: Dedicated Node Groups (hard isolation)**
+
+For regulated tenants (finance, healthcare), use node taints to pin workloads to dedicated nodes:
+
+```yaml
+# Taint dedicated nodes
+kubectl taint nodes node-group-tenant-a dedicated=tenant-a:NoSchedule
+
+# Tenant-a pods must tolerate this
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: tenant-a
+    effect: NoSchedule
+nodeSelector:
+  tenant: tenant-a
+```
+
+**Comparison: Soft vs Hard isolation**
+
+| Approach | Use case | Blast radius |
+|---|---|---|
+| Namespace + RBAC + NetworkPolicy | Internal teams, cost sharing | Low |
+| + ResourceQuota + LimitRange | Multi-product on shared cluster | Medium |
+| + Dedicated node groups | External customers, compliance | Minimal |
+| Separate clusters | PCI-DSS, HIPAA, zero-trust | Zero cross-tenant |
+
+**Real scenario:** We ran three product teams on one EKS cluster with just namespaces and RBAC. One team ran a batch ML training job that consumed all available CPU on shared nodes — the payment service pods were throttled and latency went from 120ms to 4.2s. After adding ResourceQuota (capping each namespace at 10 CPU requests) and dedicated node groups for the payment service (`taint: team=payments:NoSchedule`), batch jobs could never touch payment nodes. Payment latency stayed flat even during peak batch processing.
+
+**When to use hard node isolation:** any workload touching PII, financial data, or with SLA commitments where another team's noisy workload is an unacceptable risk.
+
+---
+
+## 25. How do you enforce that only validated Kubernetes configs reach production in a CI/CD pipeline?
+
+> **Also asked as:** "How do you prevent bad configs from reaching production in a CI/CD pipeline?"
+
+Bad configs in production — wrong resource limits, missing labels, broken Ingress rules — cause outages that are entirely preventable. I enforce validation at three gates: **static analysis in CI**, **admission control in the cluster**, and **diff review before apply**.
+
+**Gate 1: Static validation in CI (before merge)**
+
+```yaml
+# GitHub Actions step — runs on every PR
+- name: Lint with kubeval / kubeconform
+  run: |
+    kubeconform -strict -kubernetes-version 1.29.0 ./manifests/
+
+- name: Lint Helm chart
+  run: |
+    helm lint ./charts/my-app --strict
+
+- name: Dry-run against real cluster (staging)
+  run: |
+    kubectl apply --dry-run=server -f ./manifests/
+    # Server-side dry-run catches: missing CRDs, quota violations,
+    # admission webhook rejections — things static tools miss
+```
+
+`kubeconform` catches: wrong apiVersion, missing required fields, type mismatches.
+`helm lint --strict` catches: missing values, invalid templates, undefined references.
+`--dry-run=server` catches: quota exceeded, policy violations, missing secrets.
+
+**Gate 2: OPA/Kyverno admission control in cluster**
+
+Kyverno policy that blocks deployment without resource limits:
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: check-resources
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+      validate:
+        message: "CPU and memory limits are required on all containers."
+        pattern:
+          spec:
+            template:
+              spec:
+                containers:
+                  - resources:
+                      limits:
+                        cpu: "?*"
+                        memory: "?*"
+```
+
+Every `kubectl apply` or Helm deploy must pass this — even from automated pipelines.
+
+**Gate 3: GitOps diff review (ArgoCD)**
+
+With ArgoCD, no one applies directly to production. Changes go through Git:
+
+```
+PR opened → CI runs kubeconform + helm lint + dry-run
+         → PR review (human)
+         → Merge to main
+         → ArgoCD detects diff → shows sync preview
+         → Manual sync approval for production
+```
+
+ArgoCD's sync preview shows exactly what will change before apply — like `terraform plan` but for K8s.
+
+**Common bad configs caught by each gate:**
+
+| Bad config | Caught by |
+|---|---|
+| Wrong `apiVersion` | kubeconform |
+| Missing `limits` | Kyverno ClusterPolicy |
+| Image from unverified registry | Kyverno + Cosign |
+| ResourceQuota exceeded | `--dry-run=server` |
+| Broken Ingress path | `helm lint` + dry-run |
+| Drift from Git | ArgoCD |
+
+**Real scenario:** A developer updated a Helm values file and accidentally set `resources.limits.memory: 128` (integer, not string). Helm rendered it as an invalid manifest. Without CI validation, this deployed fine on staging (which had no LimitRange enforcement) but failed on production during the next deployment. After adding `kubeconform` to the PR pipeline, this class of error gets caught in under 30 seconds — before code review even begins.
+
+---

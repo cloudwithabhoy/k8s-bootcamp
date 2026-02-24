@@ -559,7 +559,7 @@ You run `kubectl apply -f deployment.yaml`:
 
 ## 14. What are the different Kubernetes deployment strategies?
 
-> **Also asked as:** "Explain the deployment strategy used in your organisation" · "How do you ensure zero-downtime deployments?"
+> **Also asked as:** "Explain the deployment strategy used in your organisation" · "How do you ensure zero-downtime deployments?" · "How would you ensure zero-downtime deployment during a critical update?"
 
 Four main strategies, each with different risk profiles:
 

@@ -76,7 +76,7 @@ Don't guess. Follow the money systematically — compute, then storage, then net
 
 ## 4. A pod is continuously restarting and entering CrashLoopBackOff. How would you troubleshoot it?
 
-> **Also asked as:** "How do you debug a container crash?" · "Your container keeps crashing — what do you check?" · "Pod stuck in CrashLoopBackOff error — how will you troubleshoot?"
+> **Also asked as:** "How do you debug a container crash?" · "Your container keeps crashing — what do you check?" · "Pod stuck in CrashLoopBackOff error — how will you troubleshoot?" · "A pod is stuck in CrashLoopBackOff. Logs show failure during initialization — how do you troubleshoot?"
 
 CrashLoopBackOff means: container starts → crashes → K8s restarts it → crashes again → backoff delay increases (10s, 20s, 40s, up to 5 minutes). It's not an error itself — it's K8s telling you "I keep trying but this thing keeps dying."
 
@@ -149,6 +149,8 @@ kubectl get pod <pod-name> -o jsonpath='{.spec.containers[0].resources.limits.me
 ---
 
 ## 6. Image pull is failing — how do you triage `ImagePullBackOff`?
+
+> **Also asked as:** "A Pod is stuck in ImagePullBackOff. How do you troubleshoot?"
 
 `ImagePullBackOff` means K8s tried to pull the container image and failed. It backs off exponentially (10s, 20s, 40s... up to 5 minutes) and keeps retrying.
 
@@ -367,6 +369,8 @@ Immediate fix: deleted the job pod, memory freed, evicted pods rescheduled. Perm
 ---
 
 ## 9. Pod is not scheduled due to resource constraints. How do you handle it?
+
+> **Also asked as:** "Helm deployment fails due to insufficient cluster resources — what's your approach?"
 
 A pod stuck in `Pending` due to resource constraints means the scheduler looked at every node and couldn't find one that can satisfy the pod's requests. The pod exists as an API object but no node has accepted it. It will stay `Pending` indefinitely — K8s will not schedule it until something changes.
 
@@ -705,5 +709,223 @@ kubectl get nodes -w
 ```
 
 **Real scenario:** After enabling a new namespace with GPU-bound ML workloads, all pods sat `Pending`. The autoscaler was running. Logs showed: `"No node group found for pod — all node groups have unsatisfied requirements"`. The GPU pods had `nodeSelector: hardware=gpu` but the GPU node group in the autoscaler config had nodes labeled `accelerator=nvidia`. The autoscaler correctly concluded that no node group could satisfy the pods — so it didn't scale. Fix: standardized the label to `hardware=gpu` across both the node group launch template and the pods. Autoscaler immediately triggered a scale-up and 2 GPU nodes were provisioned within 3 minutes.
+
+---
+
+## 12. Your Ingress controller crashes repeatedly under heavy load. How do you stabilize it?
+
+Ingress controller crashes under load usually mean one of three things: resource exhaustion (OOMKilled), connection backlog overflow, or misconfigured worker settings. Treat the controller like a production workload — it needs resource limits, HPA, PDB, and tuning.
+
+**Step 1: Identify the crash cause**
+
+```bash
+kubectl get pods -n ingress-nginx
+# NAME                                       READY   STATUS      RESTARTS
+# ingress-nginx-controller-xxx               0/1     OOMKilled   14
+
+kubectl describe pod -n ingress-nginx ingress-nginx-controller-xxx
+# Last State: Terminated
+#   Reason: OOMKilled
+#   Exit Code: 137
+```
+
+**Step 2: Increase resource limits (most common fix)**
+
+Default Helm install of ingress-nginx gives the controller very conservative limits. Under production load, 256Mi is never enough.
+
+```yaml
+# values.yaml for ingress-nginx
+controller:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+```
+
+**Step 3: Scale horizontally with HPA**
+
+One ingress controller pod is a single point of failure. Run at least 2, scale with HPA:
+
+```yaml
+controller:
+  replicaCount: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+```
+
+**Step 4: Add PodDisruptionBudget**
+
+Prevents all replicas from being evicted simultaneously during node maintenance:
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ingress-nginx-pdb
+  namespace: ingress-nginx
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+```
+
+**Step 5: Tune NGINX worker settings**
+
+Under high concurrency, default worker settings saturate quickly:
+
+```yaml
+# ConfigMap for ingress-nginx
+data:
+  worker-processes: "auto"           # one worker per CPU core
+  max-worker-connections: "65536"    # per worker connection limit
+  keep-alive: "75"                   # keepalive timeout (seconds)
+  keep-alive-requests: "1000"        # max requests per keepalive connection
+  upstream-keepalive-connections: "200"
+  proxy-connect-timeout: "10"
+  proxy-send-timeout: "60"
+  proxy-read-timeout: "60"
+```
+
+**Step 6: Enable rate limiting to protect under surge**
+
+```yaml
+# Ingress annotation
+nginx.ingress.kubernetes.io/limit-rps: "100"
+nginx.ingress.kubernetes.io/limit-connections: "20"
+```
+
+**Step 7: Spread across nodes with anti-affinity**
+
+```yaml
+controller:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+          topologyKey: kubernetes.io/hostname
+```
+
+This guarantees no two controller pods land on the same node — one node crash can't take out the entire ingress layer.
+
+**Root cause comparison:**
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| OOMKilled | Memory limit too low | Increase `limits.memory` |
+| High CPU throttle | CPU limit too low | Increase `limits.cpu` |
+| 502/504 under load | Too few workers or replicas | HPA + worker tuning |
+| All pods go down at once | No PDB, no anti-affinity | Add PDB + podAntiAffinity |
+| Spikes overwhelm upstream | No rate limiting | Add `limit-rps` annotations |
+
+**Real scenario:** Our ingress-nginx controller was handling 8,000 RPS normally but crashed every time a flash sale hit 25,000 RPS. OOMKilled every time — memory limit was 256Mi. We increased memory to 2Gi, enabled HPA (2→8 replicas), added podAntiAffinity across 3 AZs, and set `worker-processes: auto`. The next flash sale hit 31,000 RPS — controller scaled to 6 replicas, zero crashes, p99 latency stayed under 180ms.
+
+---
+
+## 13. All pods in one namespace suddenly fail readiness checks. What do you do?
+
+When all pods in a namespace fail readiness simultaneously, the cause is almost never inside the pods — it's something shared across the namespace: a dependency, a config change, or a network/DNS issue. Don't restart pods first. Investigate the shared layer.
+
+**Step 1: Confirm the scope**
+
+```bash
+kubectl get pods -n my-namespace
+# All 0/1 READY but STATUS is Running — readiness probe failing, not crashing
+
+kubectl describe pod <any-pod> -n my-namespace
+# Events:
+# Readiness probe failed: HTTP probe failed with statuscode: 503
+# or: dial tcp: i/o timeout
+# or: Get "http://10.0.0.5:8080/health": context deadline exceeded
+```
+
+**Step 2: Check what changed recently**
+
+```bash
+# Recent events in the namespace
+kubectl get events -n my-namespace --sort-by='.lastTimestamp' | tail -30
+
+# Recent ConfigMap or Secret changes
+kubectl get configmaps -n my-namespace -o yaml | grep -A5 "last-applied"
+
+# Recent deployments
+kubectl rollout history deployment -n my-namespace
+```
+
+**Step 3: Test the readiness probe endpoint manually**
+
+```bash
+# Exec into one of the failing pods
+kubectl exec -n my-namespace <pod> -- curl -v http://localhost:8080/health
+
+# If probe is hitting another service:
+kubectl exec -n my-namespace <pod> -- curl -v http://downstream-service:8080/health
+```
+
+**Step 4: Check downstream dependencies**
+
+Most "all pods fail readiness" incidents are caused by a dependency going down — database, cache, external API:
+
+```bash
+# Is the database service reachable from within the namespace?
+kubectl exec -n my-namespace <pod> -- nc -zv postgres-service 5432
+# or
+kubectl exec -n my-namespace <pod> -- curl http://redis-service:6379
+
+# Check if the dependency itself is healthy
+kubectl get pods -n database-namespace
+```
+
+**Step 5: Check DNS resolution**
+
+A CoreDNS issue or NetworkPolicy change can break service discovery:
+
+```bash
+kubectl exec -n my-namespace <pod> -- nslookup downstream-service
+kubectl exec -n my-namespace <pod> -- nslookup downstream-service.other-namespace.svc.cluster.local
+
+# Check CoreDNS
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl logs -n kube-system -l k8s-app=kube-dns
+```
+
+**Step 6: Check NetworkPolicy changes**
+
+If a NetworkPolicy was recently added/changed, it might be blocking the readiness probe path or the backend connection:
+
+```bash
+kubectl get networkpolicy -n my-namespace
+kubectl describe networkpolicy -n my-namespace
+```
+
+**Step 7: Check if a ConfigMap/Secret changed**
+
+```bash
+# Did a config change that broke the health endpoint?
+kubectl rollout undo deployment/<app> -n my-namespace
+# See if readiness recovers — if yes, the last config change was the cause
+```
+
+**Common root causes and fixes:**
+
+| Root cause | Signal | Fix |
+|---|---|---|
+| Downstream DB/cache down | Probe fails with connection refused | Fix dependency, add circuit breaker |
+| Bad ConfigMap/Secret update | All pods affected after deploy | `kubectl rollout undo` |
+| NetworkPolicy too restrictive | DNS lookup fails, connection timeout | Audit and fix NetworkPolicy |
+| Readiness probe path changed | 404 on health endpoint | Sync probe path with new app endpoint |
+| CoreDNS overloaded | DNS timeouts | Scale CoreDNS, check ndots setting |
+| Quota exhausted | New pods can't start | Check `kubectl describe resourcequota -n my-namespace` |
+
+**Real scenario:** All 12 pods in our `payments` namespace failed readiness at 2:47 AM. No deployment had happened. First check: `kubectl get events` showed nothing unusual. Second check: exec into a pod and curl the health endpoint — got `503 Service Unavailable`. The health endpoint called Redis for a cache check. Third check: `kubectl get pods -n caching` — Redis was in `Pending` (node had been drained for maintenance and the PVC couldn't bind on the new node). Payments pods were healthy; Redis was the root cause. Fix: resolved the PVC binding issue, Redis came up, all 12 pods passed readiness within 90 seconds. No restart needed.
 
 ---

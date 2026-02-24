@@ -1491,3 +1491,391 @@ kubectl describe hpa my-app-hpa
 **Real scenario:** Our order-processing service scaled on CPU alone. During flash sales, CPU stayed low (orders were I/O-bound, mostly waiting on the database) but the SQS queue grew to 50,000 messages. HPA saw healthy CPU → didn't scale → queue backed up → orders delayed by 45 minutes. We switched to scaling on SQS queue depth — target 500 messages per pod. During the next flash sale, HPA scaled from 5 to 28 pods in 4 minutes, queue drained normally. CPU-only HPA is wrong for I/O-bound workloads.
 
 ---
+
+## 28. How do you share Helm charts internally across teams?
+
+There are three main approaches: **a Helm chart repository**, **an OCI registry**, or **a shared Git monorepo**. In production, OCI registries (ECR, Harbor) are the most operationally clean.
+
+**Option 1: OCI registry (recommended — ECR or Harbor)**
+
+Helm v3.8+ supports pushing/pulling charts as OCI artifacts — same registry you use for Docker images.
+
+```bash
+# Package the chart
+helm package ./charts/my-app
+# Output: my-app-1.2.0.tgz
+
+# Push to ECR
+aws ecr create-repository --repository-name helm-charts/my-app
+helm push my-app-1.2.0.tgz oci://123456789.dkr.ecr.us-east-1.amazonaws.com/helm-charts
+
+# Another team pulls it
+helm install my-release oci://123456789.dkr.ecr.us-east-1.amazonaws.com/helm-charts/my-app --version 1.2.0
+```
+
+**Benefits:** Versioned like Docker images, access controlled via IAM/RBAC, no extra infrastructure needed if you already have ECR.
+
+**Option 2: ChartMuseum (HTTP-based Helm repo)**
+
+ChartMuseum is a lightweight Helm chart repository server. Run it in-cluster or on S3.
+
+```bash
+# Deploy ChartMuseum in cluster
+helm install chartmuseum chartmuseum/chartmuseum \
+  --set env.open.STORAGE=amazon \
+  --set env.open.STORAGE_AMAZON_BUCKET=my-helm-charts \
+  --set env.open.STORAGE_AMAZON_REGION=us-east-1
+
+# Push a chart
+helm plugin install https://github.com/chartmuseum/helm-push
+helm cm-push ./charts/my-app http://chartmuseum.internal.company.com
+
+# Other teams add the repo
+helm repo add internal http://chartmuseum.internal.company.com
+helm repo update
+helm install my-release internal/my-app --version 1.2.0
+```
+
+**Option 3: Harbor (full OCI registry with scanning)**
+
+Harbor is an enterprise registry that supports Helm charts, Docker images, image scanning (Trivy), and replication. If you already run Harbor for Docker images, add Helm there too.
+
+```bash
+helm push my-app-1.2.0.tgz oci://harbor.company.com/helm-charts
+```
+
+**Option 4: Git monorepo + path-based reference**
+
+Simple but less flexible. All charts live in one repo:
+
+```
+infra-charts/
+├── charts/
+│   ├── my-app/
+│   ├── postgres/
+│   └── redis/
+```
+
+Teams reference charts by path. Works with ArgoCD's `path` field. No versioning beyond Git tags.
+
+**Versioning convention (follow this regardless of storage):**
+
+```
+MAJOR.MINOR.PATCH
+1.2.0 → breaking change in values schema
+1.2.1 → bug fix, backwards compatible
+1.3.0 → new optional feature added
+```
+
+Lock chart versions in all environments — never use `*` or `latest`.
+
+**Real scenario:** We had 6 teams each maintaining their own copy of our `nginx-ingress` Helm chart with slight differences. When a CVE hit the ingress controller, we had to patch 6 separate charts. We migrated to a shared OCI registry on ECR: one chart, versioned, owned by the platform team. Patching now means bumping the chart version in ECR + each team updates their version pin in their ArgoCD Application. One change, consistent across all teams, in under 30 minutes.
+
+---
+
+## 29. What is Helm chart testing and how is it done?
+
+Helm chart testing validates that your chart deploys correctly and the deployed application actually works — not just that the YAML renders. It catches bugs that `helm lint` and `--dry-run` miss because those only validate syntax, not runtime behaviour.
+
+**Two levels of testing:**
+
+**Level 1: `helm test` — built-in hook-based testing**
+
+You define test pods inside `templates/tests/`. These run after `helm install` and report pass/fail.
+
+```
+charts/my-app/
+└── templates/
+    └── tests/
+        └── test-connection.yaml
+```
+
+```yaml
+# templates/tests/test-connection.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "my-app.fullname" . }}-test-connection"
+  annotations:
+    "helm.sh/hook": test                # runs on `helm test`
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: wget
+      image: busybox
+      command: ['wget']
+      args: ['{{ include "my-app.fullname" . }}:{{ .Values.service.port }}']
+      # Exits 0 if connection succeeds → test passes
+      # Exits non-zero → test fails, helm test reports failure
+```
+
+```bash
+# Deploy chart then run tests
+helm install my-release ./charts/my-app
+helm test my-release
+
+# Output:
+# NAME: my-release
+# LAST DEPLOYED: Mon Feb 24 10:00:00 2026
+# PHASE: test
+# STATUS: succeeded
+# TEST SUITE:     my-release-test-connection
+# Last Started:   Mon Feb 24 10:00:05 2026
+# Last Completed: Mon Feb 24 10:00:08 2026
+# Phase:          Succeeded
+```
+
+**Level 2: `helm-unittest` — unit testing chart templates**
+
+`helm-unittest` is a Helm plugin that tests rendered YAML output without deploying anything. Catches template logic bugs.
+
+```bash
+helm plugin install https://github.com/helm-unittest/helm-unittest
+```
+
+```yaml
+# tests/deployment_test.yaml
+suite: deployment tests
+templates:
+  - templates/deployment.yaml
+tests:
+  - it: should set replicas from values
+    set:
+      replicaCount: 3
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  - it: should use correct image
+    set:
+      image.repository: myapp
+      image.tag: v1.2.0
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: myapp:v1.2.0
+
+  - it: should always set resource limits
+    asserts:
+      - isNotEmpty:
+          path: spec.template.spec.containers[0].resources.limits
+```
+
+```bash
+helm unittest ./charts/my-app
+# Tests: 12 passed, 0 failed
+```
+
+**Level 3: Integration testing with `ct` (chart-testing)**
+
+`ct` (from the Helm community) runs `helm lint` + `helm install` + `helm test` on changed charts in CI:
+
+```bash
+# Install chart-testing
+pip install pytest-helm-charts
+# or use the Docker image: quay.io/helmpack/chart-testing
+
+# Run in CI — tests only charts that changed vs main
+ct install --target-branch main --chart-dirs charts/
+```
+
+**CI pipeline combining all three:**
+
+```yaml
+# .github/workflows/helm-test.yaml
+jobs:
+  test:
+    steps:
+      - name: Lint
+        run: helm lint ./charts/my-app --strict
+
+      - name: Unit tests
+        run: helm unittest ./charts/my-app
+
+      - name: Deploy to test cluster + integration test
+        run: |
+          helm install test-release ./charts/my-app \
+            -f ./charts/my-app/ci/test-values.yaml
+          helm test test-release
+
+      - name: Cleanup
+        run: helm uninstall test-release
+```
+
+**What each level catches:**
+
+| Level | Tool | Catches |
+|---|---|---|
+| Lint | `helm lint` | Missing required values, template syntax errors |
+| Unit test | `helm-unittest` | Wrong rendered YAML, broken conditionals |
+| Deploy test | `helm test` | App fails to start, wrong port, broken health check |
+| Integration | `ct` | Cross-chart dependencies, cluster-level failures |
+
+**Real scenario:** We had a Helm chart with a conditional block: if `ingress.enabled: true`, create an Ingress. A developer refactored the template and accidentally broke the conditional — Ingress was always created even when disabled. `helm lint` passed. `--dry-run` passed. But `helm-unittest` caught it immediately:
+
+```
+FAIL  should not create ingress when disabled
+  - templates/ingress.yaml should have 0 documents but got 1
+```
+
+Caught in CI, never reached staging. Without the unit test, this would have created Ingresses in every namespace that disabled ingress on purpose.
+
+---
+
+## 30. A node hosting critical workloads crashes permanently. How do you ensure workloads recover automatically?
+
+Kubernetes self-heals by design — a Deployment's ReplicaSet controller watches pod count and recreates pods when they disappear. But "automatic recovery" requires the right configuration in place before the node fails, not after.
+
+**How Kubernetes detects and recovers from a node failure:**
+
+```
+Node crashes
+  → kubelet stops sending heartbeats
+  → Node Controller marks node NotReady (after 40s default)
+  → Node stays NotReady for node-monitor-grace-period (default 40s)
+  → After pod-eviction-timeout (default 5 minutes): pods evicted
+  → ReplicaSet controller sees pod count drop
+  → Scheduler places replacement pods on healthy nodes
+  → Total automatic recovery time: ~5–6 minutes (default settings)
+```
+
+**What you must configure to ensure recovery works:**
+
+**1. Use Deployments (not bare Pods)**
+
+Bare pods are NOT rescheduled when their node dies — only pods managed by a controller (Deployment, StatefulSet, DaemonSet) are.
+
+```yaml
+# WRONG — bare pod, lost forever if node dies
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-app
+
+# RIGHT — Deployment manages replicas, reschedules on failure
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  replicas: 3
+```
+
+**2. Run multiple replicas with pod anti-affinity**
+
+With 1 replica, one node failure = full outage until pod reschedules. With 3 replicas spread across nodes, one node failure = at most 1/3 capacity loss:
+
+```yaml
+spec:
+  replicas: 3
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: my-app
+              topologyKey: kubernetes.io/hostname  # one pod per node
+```
+
+**3. Set PodDisruptionBudget**
+
+Ensures at least N pods are always available, even during voluntary disruptions (node drain, upgrades):
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app-pdb
+spec:
+  minAvailable: 2        # or use maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+**4. Set resource requests (required for scheduling)**
+
+Without resource requests, the scheduler can place all pods on one node. With requests, it distributes load across nodes:
+
+```yaml
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+```
+
+**5. Configure liveness + readiness probes**
+
+After rescheduling, readiness probe prevents traffic from reaching the pod until it's actually ready:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 3
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+```
+
+**6. Reduce eviction timeout for faster recovery (optional)**
+
+Default eviction timeout is 5 minutes. For critical workloads you can reduce this in the controller manager:
+
+```
+--pod-eviction-timeout=60s    # reduces from 5min to 1min
+```
+
+On EKS/GKE this is managed by the cloud provider. Use `tolerations` with short `tolerationSeconds` instead:
+
+```yaml
+tolerations:
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30    # evict from NotReady node after 30s (default 300s)
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+```
+
+**7. Ensure Cluster Autoscaler or Karpenter replaces the lost node**
+
+If capacity drops below what remaining pods need, autoscaler provisions a new node:
+
+```yaml
+# Karpenter NodePool — always maintains capacity
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+spec:
+  disruption:
+    budgets:
+      - nodes: "10%"    # never remove more than 10% of nodes at once
+```
+
+**Recovery time summary:**
+
+| Configuration | Recovery time |
+|---|---|
+| Bare pod, no controller | Never (manual only) |
+| Deployment, 1 replica, default settings | ~5–6 minutes |
+| Deployment, 3 replicas + anti-affinity | Instant (other pods absorb traffic) |
+| + Short `tolerationSeconds: 30` | ~1 minute for rescheduled pod |
+| + Pre-cached image on nodes | ~30 seconds for new pod to be ready |
+
+**Real scenario:** A spot instance running 2 of our 3 API replicas was terminated by AWS (spot interruption — 2-minute warning). With default settings and no anti-affinity, both replicas had landed on the same node. When it died, 2 out of 3 pods were gone — 66% capacity lost, 502 errors for 4 minutes while pods rescheduled and warmed up. After adding `podAntiAffinity` with `topologyKey: kubernetes.io/hostname`, the 3 replicas spread across 3 different nodes. The next spot interruption killed 1 node — 1 pod was rescheduled, the other 2 continued serving traffic. Zero user impact.
+
+---

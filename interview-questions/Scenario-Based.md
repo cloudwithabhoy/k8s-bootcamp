@@ -58,6 +58,8 @@ But the postgres pod was running. So why no endpoints? I compared `kubectl descr
 
 ## 3. A deployment succeeded, but users get 502 errors. What do you check first, and in what order?
 
+> **Also asked as:** "During high traffic, your app shows intermittent 502 errors through Ingress — how do you debug?"
+
 502 means the gateway/proxy received an invalid response from upstream. The deploy succeeded, K8s is happy, but users aren't.
 
 **My order of checks:**
@@ -665,5 +667,294 @@ This puts you inside the exact cluster environment — same network, same DNS, s
 **Real scenario:** A Node.js service worked perfectly in local Docker but crashed in K8s every time with `ENOENT: no such file or directory, open '/app/config/settings.json'`. The file existed in the Docker image. The problem: the Helm chart mounted a ConfigMap at `/app/config/` — which replaced the entire directory, wiping out `settings.json` that was baked into the image. Locally, no ConfigMap mount existed so the image's file was used fine.
 
 Fix: changed the ConfigMap mount from a directory mount to a single file mount at `/app/config/env-settings.json`. The image's `settings.json` was preserved and the ConfigMap values were available separately. We found it by running `kubectl exec <pod> -- ls /app/config/` and seeing only one file instead of three. Took 90 minutes to debug — would have taken 5 minutes with this checklist.
+
+---
+
+## 20. An entire Kubernetes region goes down. How do you failover workloads?
+
+A full region failure means every node, control plane, and managed service in that region is unavailable. The only options are pre-built: you can't build a multi-region failover during an outage. Everything here has to be set up in advance.
+
+**Prerequisites (build these before the outage, not during):**
+
+**1. Multi-cluster setup with ArgoCD**
+
+Run ArgoCD in a region that's not your primary:
+
+```yaml
+# ArgoCD ApplicationSet — deploys to both clusters simultaneously
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: my-app
+spec:
+  generators:
+    - clusters:
+        selector:
+          matchLabels:
+            env: production
+  template:
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/org/infra
+        path: charts/my-app
+      destination:
+        server: '{{server}}'
+        namespace: my-app
+```
+
+This keeps `us-east-1` and `eu-west-1` clusters in sync — same version, same config, always.
+
+**2. Route 53 health-check-based DNS failover**
+
+```hcl
+# Primary record — us-east-1 load balancer
+resource "aws_route53_record" "primary" {
+  zone_id = var.zone_id
+  name    = "api.company.com"
+  type    = "A"
+
+  alias {
+    name    = aws_lb.us_east.dns_name
+    zone_id = aws_lb.us_east.zone_id
+  }
+
+  set_identifier = "primary"
+  failover_routing_policy { type = "PRIMARY" }
+
+  health_check_id = aws_route53_health_check.primary.id
+}
+
+# Secondary record — eu-west-1 load balancer
+resource "aws_route53_record" "secondary" {
+  zone_id = var.zone_id
+  name    = "api.company.com"
+  type    = "A"
+
+  alias {
+    name    = aws_lb.eu_west.dns_name
+    zone_id = aws_lb.eu_west.zone_id
+  }
+
+  set_identifier = "secondary"
+  failover_routing_policy { type = "SECONDARY" }
+}
+
+resource "aws_route53_health_check" "primary" {
+  fqdn              = aws_lb.us_east.dns_name
+  port              = 443
+  type              = "HTTPS"
+  resource_path     = "/health"
+  failure_threshold = 3
+  request_interval  = 10
+}
+```
+
+When the health check fails 3 times (30 seconds), Route 53 automatically routes all traffic to the secondary. No manual action.
+
+**3. Stateless workloads — failover is automatic**
+
+If your app is stateless (no local disk, reads config from env/ConfigMap, connects to external DB), failover is transparent — Route 53 switches DNS and the secondary cluster already has the same pods running.
+
+**4. Stateful workloads — requires data replication**
+
+Databases need cross-region replication before a failover is possible:
+
+| Database | Replication mechanism |
+|---|---|
+| RDS | Multi-region read replica → promote to primary |
+| Aurora | Global Database — failover in ~1 minute |
+| DynamoDB | Global Tables — active-active, no promotion needed |
+| Redis | ElastiCache Global Datastore |
+| Self-managed | Velero for PVC snapshots + cross-region restore |
+
+**Failover runbook (when region goes down):**
+
+```bash
+# 1. Confirm region is down (not a localized issue)
+aws ec2 describe-availability-zones --region us-east-1
+
+# 2. Route 53 should have already auto-failed over if health checks are configured
+# Verify DNS is pointing to secondary:
+dig api.company.com
+
+# 3. If DNS hasn't auto-failed — manual override:
+aws route53 change-resource-record-sets \
+  --hosted-zone-id Z123 \
+  --change-batch file://manual-failover.json
+
+# 4. Promote read replica (RDS)
+aws rds promote-read-replica --db-instance-identifier my-db-eu-west-replica
+
+# 5. Scale secondary cluster if it was running at reduced capacity
+kubectl scale deployment my-app --replicas=20 -n my-app
+# or trigger Karpenter scale-up via load
+
+# 6. Communicate status to stakeholders
+```
+
+**Active-passive vs active-active:**
+
+| Mode | RTO | RPO | Cost | Best for |
+|---|---|---|---|---|
+| Active-passive | 1–5 min | Minutes | ~100% extra infra | Most production apps |
+| Active-active | Seconds | Near-zero | ~200% extra infra | Payment, auth, zero-tolerance |
+| Backup-restore | Hours | Hours | Minimal | Non-critical apps |
+
+**Real scenario:** Our primary EKS cluster in `us-east-1` went down during an AWS networking incident affecting the entire region (not us alone — about 40 services were impacted). Route 53 health checks detected the failure in 30 seconds. DNS automatically shifted to `eu-west-1`. The stateless API services were up in the secondary within 90 seconds of the region failure. The database took 4 minutes because we had to manually promote the RDS read replica (Aurora Global Database would have done this in ~60s automatically). Total user-facing downtime: 4.5 minutes. Post-incident: we migrated the database to Aurora Global to bring that 4 minutes down to under 90 seconds.
+
+---
+
+## 21. Your cluster is hit by a massive traffic surge, and HPA cannot scale pods fast enough. How do you handle it?
+
+HPA has inherent lag: it scrapes metrics every 15 seconds, evaluates every 30–60 seconds, then waits for new pods to start and pass readiness. During a sudden surge, that delay can mean 2–5 minutes of degraded service. You need strategies that work both faster than HPA and alongside it.
+
+**Why HPA is slow:**
+
+```
+Traffic spike → metrics server scrapes (15s lag)
+             → HPA evaluates (30s default period)
+             → scheduler places new pods (~5s)
+             → kubelet pulls image (30s–2min if not cached)
+             → readiness probe passes (10s–60s depending on app)
+
+Total: 1–4 minutes minimum before new pods serve traffic
+```
+
+**Fix 1: Pre-warm with scheduled scaling (KEDA CronJob scaler)**
+
+If you know traffic patterns (e.g., flash sale at 2 PM), scale proactively:
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: my-app-scaledobject
+spec:
+  scaleTargetRef:
+    name: my-app
+  minReplicaCount: 5
+  maxReplicaCount: 50
+  triggers:
+    - type: cron
+      metadata:
+        timezone: Asia/Kolkata
+        start: "55 13 * * *"    # scale up 5 min before 2 PM
+        end: "30 15 * * *"      # scale down at 3:30 PM
+        desiredReplicas: "30"
+    - type: prometheus             # also scale on actual load
+      metadata:
+        serverAddress: http://prometheus:9090
+        metricName: http_requests_per_second
+        threshold: "500"
+        query: sum(rate(http_requests_total[1m]))
+```
+
+**Fix 2: Tune HPA behavior for faster scale-up**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+spec:
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0    # no stabilization — scale up immediately
+      policies:
+        - type: Percent
+          value: 100                   # double replicas every 15 seconds
+          periodSeconds: 15
+        - type: Pods
+          value: 10                    # or add 10 pods at once
+          periodSeconds: 15
+      selectPolicy: Max                # use whichever adds more pods
+    scaleDown:
+      stabilizationWindowSeconds: 300  # slow scale-down to avoid thrashing
+```
+
+**Fix 3: Pre-pull images on all nodes**
+
+New pods spend most startup time pulling images. Use a DaemonSet to pre-cache:
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-prepuller
+spec:
+  selector:
+    matchLabels:
+      app: image-prepuller
+  template:
+    spec:
+      initContainers:
+        - name: prepull
+          image: my-app:v1.2.0    # same image your deployment uses
+          command: ["sh", "-c", "echo image pulled"]
+      containers:
+        - name: pause
+          image: k8s.gcr.io/pause:3.9
+```
+
+Once the DaemonSet runs, the image is cached on every node. New pods start in seconds, not minutes.
+
+**Fix 4: Use Karpenter for faster node provisioning**
+
+Cluster Autoscaler takes 3–5 minutes to provision a new node. Karpenter takes 30–60 seconds:
+
+```yaml
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: burst-pool
+spec:
+  template:
+    spec:
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]   # spot for burst capacity
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["m5.xlarge", "m5.2xlarge", "m6i.xlarge"]
+  limits:
+    cpu: "200"
+  disruption:
+    consolidationPolicy: WhenUnderutilized
+```
+
+**Fix 5: Circuit breaker + graceful degradation in app**
+
+When pods are overloaded before new ones are ready, protect existing pods from being crushed:
+
+```yaml
+# Ingress rate limiting — protect backend during surge
+nginx.ingress.kubernetes.io/limit-rps: "200"
+nginx.ingress.kubernetes.io/limit-connections: "50"
+```
+
+Return cached responses or a "we're busy, try again" response rather than queuing indefinitely.
+
+**Fix 6: Increase `minReplicas` permanently**
+
+The cheapest fix: don't start from 1 replica. Start from a baseline that handles 2x normal load:
+
+```yaml
+spec:
+  minReplicas: 10    # never below 10, even at 3 AM
+  maxReplicas: 50
+```
+
+**Decision table:**
+
+| Strategy | Helps with | Latency to effect |
+|---|---|---|
+| Scheduled pre-scaling | Known traffic events | Immediate (pre-done) |
+| HPA behavior tuning | Faster reaction to metrics | 15–30 seconds |
+| Image pre-pulling | Pod startup time | Immediate |
+| Karpenter | Node provisioning speed | 30–60 seconds |
+| Higher `minReplicas` | Always-on baseline capacity | Immediate |
+| Rate limiting | Protect pods during surge | Immediate |
+
+**Real scenario:** A product launch drove 10x normal traffic in 3 minutes. HPA was configured (CPU target 70%) but pods needed 90 seconds each to start (large image, slow readiness probe). By the time 8 new pods were ready, the original 4 pods had been throttled to the point of 30s response times. Fix applied for next launch: set `minReplicas: 15`, tuned HPA `scaleUp.stabilizationWindowSeconds: 0` and `Percent: 100` policy, pre-cached the image via DaemonSet, and pre-scaled to 30 replicas 10 minutes before the launch using a KEDA cron trigger. Next product launch: latency stayed flat throughout the traffic surge.
 
 ---
